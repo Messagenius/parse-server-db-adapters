@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { StorageAdapter } from '../StorageAdapter';
 import type { SchemaType, QueryType, QueryOptions } from '../StorageAdapter';
 const Utils = require('../../../Utils');
+const oracleSql = require('./sql');
 
 // Oracle error codes
 const OracleTableDoesNotExistError = 942; // ORA-00942: table or view does not exist
@@ -451,13 +452,9 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       if (fieldValue.$in.length === 0) {
         patterns.push('1 = 0'); // Return no values
       } else if (isArrayField) {
-        // For array fields, check if any element is in the array
-        // Using JSON_TABLE to unnest the array and check membership
+        // For array fields, use stored function to check if any element is in the array
         const inValues = JSON.stringify(fieldValue.$in);
-        patterns.push(`EXISTS (
-          SELECT 1 FROM JSON_TABLE(${quoteIdentifier(fieldName)}, '$[*]' COLUMNS (val PATH '$')) jt
-          WHERE jt.val IN (SELECT jv.val FROM JSON_TABLE(:v${index}, '$[*]' COLUMNS (val PATH '$')) jv)
-        )`);
+        patterns.push(`parse_array_contains(${quoteIdentifier(fieldName)}, :v${index}) = 1`);
         values[`v${index}`] = inValues;
         index += 1;
       } else {
@@ -475,12 +472,9 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       if (fieldValue.$nin.length === 0) {
         patterns.push('1 = 1'); // Return all values
       } else if (isArrayField) {
-        // For array fields, check if no element is in the array
+        // For array fields, use stored function to check if no element is in the array
         const ninValues = JSON.stringify(fieldValue.$nin);
-        patterns.push(`NOT EXISTS (
-          SELECT 1 FROM JSON_TABLE(${quoteIdentifier(fieldName)}, '$[*]' COLUMNS (val PATH '$')) jt
-          WHERE jt.val IN (SELECT jv.val FROM JSON_TABLE(:v${index}, '$[*]' COLUMNS (val PATH '$')) jv)
-        )`);
+        patterns.push(`parse_array_contains(${quoteIdentifier(fieldName)}, :v${index}) = 0`);
         values[`v${index}`] = ninValues;
         index += 1;
       } else {
@@ -499,23 +493,11 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       if (fieldValue.$all.length === 0) {
         patterns.push('1 = 0'); // Empty $all never matches
       } else {
-        // Check that every value in $all exists in the array
+        // Use stored function to check that all values exist in the array
         const allValues = JSON.stringify(fieldValue.$all);
-        patterns.push(`(
-          SELECT COUNT(DISTINCT jv.val) FROM JSON_TABLE(:v${index}, '$[*]' COLUMNS (val PATH '$')) jv
-          WHERE jv.val IN (SELECT jt.val FROM JSON_TABLE(${quoteIdentifier(fieldName)}, '$[*]' COLUMNS (val PATH '$')) jt)
-        ) = JSON_QUERY(:v${index}, '$.size()')`);
-        // Simplified version: check each value exists
-        const allChecks = fieldValue.$all.map((val, i) => {
-          const paramName = `v${index + i}`;
-          const jsonVal = typeof val === 'object' ? JSON.stringify(val) : JSON.stringify(val);
-          values[paramName] = jsonVal;
-          return `JSON_EXISTS(${quoteIdentifier(fieldName)}, '$[*]?(@ == $val)' PASSING :${paramName} AS "val")`;
-        });
-        // Override with simpler approach
-        patterns.pop(); // Remove the complex one
-        patterns.push(`(${allChecks.join(' AND ')})`);
-        index += fieldValue.$all.length;
+        patterns.push(`parse_array_contains_all(${quoteIdentifier(fieldName)}, :v${index}) = 1`);
+        values[`v${index}`] = allValues;
+        index += 1;
       }
     }
 
@@ -530,10 +512,11 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         patterns.push(`(${quoteIdentifier(fieldName)} IS NULL OR JSON_QUERY(${quoteIdentifier(fieldName)}, '$') = '[]')`);
       } else {
         // All elements in the field must be in the containedBy array
+        // Using NOT EXISTS with inline SQL as containedBy is less common
         const containedByValues = JSON.stringify(arr);
         patterns.push(`NOT EXISTS (
-          SELECT 1 FROM JSON_TABLE(${quoteIdentifier(fieldName)}, '$[*]' COLUMNS (val PATH '$')) jt
-          WHERE jt.val NOT IN (SELECT jv.val FROM JSON_TABLE(:v${index}, '$[*]' COLUMNS (val PATH '$')) jv)
+          SELECT 1 FROM JSON_TABLE(${quoteIdentifier(fieldName)}, '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt
+          WHERE jt.val NOT IN (SELECT jv.val FROM JSON_TABLE(:v${index}, '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jv)
         )`);
         values[`v${index}`] = containedByValues;
         index += 1;
@@ -1610,41 +1593,22 @@ export class OracleStorageAdapter implements StorageAdapter {
         } else if (fieldValue.__op === 'Delete') {
           updateClauses.push(`${quoteIdentifier(fieldName)} = NULL`);
         } else if (fieldValue.__op === 'Add') {
-          // Append objects to existing array using JSON_ARRAYAGG
-          // If array is null/empty, just set the new values
+          // Append objects to existing array using stored function
           const paramName = `u${paramIndex++}`;
           const col = quoteIdentifier(fieldName);
-          updateClauses.push(`${col} = (
-            SELECT COALESCE(JSON_ARRAYAGG(val RETURNING CLOB), '[]') FROM (
-              SELECT jt.val FROM JSON_TABLE(COALESCE(${col}, '[]'), '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt
-              UNION ALL
-              SELECT jn.val FROM JSON_TABLE(:${paramName}, '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jn
-            )
-          )`);
+          updateClauses.push(`${col} = parse_array_add(${col}, :${paramName})`);
           values[paramName] = JSON.stringify(fieldValue.objects);
         } else if (fieldValue.__op === 'AddUnique') {
-          // Add only unique objects to the array using UNION (removes duplicates)
+          // Add only unique objects to the array using stored function
           const paramName = `u${paramIndex++}`;
           const col = quoteIdentifier(fieldName);
-          updateClauses.push(`${col} = (
-            SELECT COALESCE(JSON_ARRAYAGG(val RETURNING CLOB), '[]') FROM (
-              SELECT jt.val FROM JSON_TABLE(COALESCE(${col}, '[]'), '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt
-              UNION
-              SELECT jn.val FROM JSON_TABLE(:${paramName}, '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jn
-            )
-          )`);
+          updateClauses.push(`${col} = parse_array_add_unique(${col}, :${paramName})`);
           values[paramName] = JSON.stringify(fieldValue.objects);
         } else if (fieldValue.__op === 'Remove') {
-          // Remove specified objects from the array
+          // Remove specified objects from the array using stored function
           const paramName = `u${paramIndex++}`;
           const col = quoteIdentifier(fieldName);
-          updateClauses.push(`${col} = (
-            SELECT COALESCE(JSON_ARRAYAGG(jt.val RETURNING CLOB), '[]')
-            FROM JSON_TABLE(COALESCE(${col}, '[]'), '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt
-            WHERE jt.val NOT IN (
-              SELECT jr.val FROM JSON_TABLE(:${paramName}, '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jr
-            )
-          )`);
+          updateClauses.push(`${col} = parse_array_remove(${col}, :${paramName})`);
           values[paramName] = JSON.stringify(fieldValue.objects)
         } else if (fieldValue.__type === 'Pointer') {
           const paramName = `u${paramIndex++}`;
@@ -2182,6 +2146,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     debug('performInitialization');
     await this._ensureConnection();
     await this._ensureSchemaCollectionExists();
+    await this._ensureStoredFunctionsExist();
 
     const promises = VolatileClassesSchemas.map(schema => {
       return this.createTable(schema.className, schema)
@@ -2204,6 +2169,28 @@ export class OracleStorageAdapter implements StorageAdapter {
       .catch(error => {
         console.error(error);
       });
+  }
+
+  async _ensureStoredFunctionsExist() {
+    debug('_ensureStoredFunctionsExist');
+    const conn = await this._getConnection();
+    try {
+      const functionDefinitions = oracleSql.getAllFunctionDefinitions();
+      for (const sql of functionDefinitions) {
+        try {
+          // Execute each function definition
+          // Oracle requires executing PL/SQL blocks with execute
+          await conn.execute(sql);
+        } catch (error) {
+          // Ignore errors for functions that already exist or have minor issues
+          // The functions use CREATE OR REPLACE so they should update if changed
+          debug('Function creation warning:', error.message);
+        }
+      }
+      await conn.commit();
+    } finally {
+      await conn.close();
+    }
   }
 
   async createIndexes(className: string, indexes: any, conn: ?any): Promise<void> {

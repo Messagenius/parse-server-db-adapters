@@ -38,25 +38,28 @@ This document tracks known limitations, unsupported features, and planned optimi
   - `$regex` on nested string fields
 
 #### Array Operators
-- **Status**: Implemented using JSON_TABLE and JSON_EXISTS
+- **Status**: Implemented using PL/SQL stored functions
 - **Supported Operators**:
   - `$in` - Check if field value is in array, or if array contains any of values
   - `$nin` - Negation of $in
   - `$all` - Check if array contains all specified values
   - `$containedBy` - Check if array is subset of specified values
 - **Implementation Notes**:
-  - Uses JSON_TABLE to unnest JSON arrays for comparison
-  - Uses JSON_EXISTS with filter expressions for $all
+  - Uses `parse_array_contains()` stored function for `$in`/`$nin`
+  - Uses `parse_array_contains_all()` stored function for `$all`
+  - Stored functions created in `sql/array/` directory (similar to PostgreSQL adapter)
 
 #### Array Update Operations
-- **Status**: Properly implemented with JSON_ARRAYAGG
+- **Status**: Implemented using PL/SQL stored functions
 - **Supported Operations**:
   - `Add` - Appends objects to existing array
   - `AddUnique` - Adds only unique objects (uses SQL UNION)
   - `Remove` - Removes specified objects from array
 - **Implementation Notes**:
-  - Uses JSON_ARRAYAGG with subqueries for atomic updates
-  - Handles null/empty arrays gracefully
+  - Uses `parse_array_add()` stored function for Add
+  - Uses `parse_array_add_unique()` stored function for AddUnique
+  - Uses `parse_array_remove()` stored function for Remove
+  - Stored functions automatically created during initialization
 
 #### Polygon Support
 - **Status**: Basic support implemented
