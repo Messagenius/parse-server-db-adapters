@@ -239,6 +239,63 @@ const quoteIdentifier = name => {
   return `"${name.replace(/"/g, '""')}"`;
 };
 
+// Check if a string is an array index (all digits)
+const isArrayIndex = (str) => /^\d+$/.test(str);
+
+// Transform dot notation field to components for JSON access
+// e.g., "a.b.c" -> ['"a"', "'b'", "'c'"]
+const transformDotFieldToComponents = fieldName => {
+  return fieldName.split('.').map((cmpt, index) => {
+    if (index === 0) {
+      return quoteIdentifier(cmpt);
+    }
+    if (isArrayIndex(cmpt)) {
+      return Number(cmpt);
+    } else {
+      return `'${cmpt}'`;
+    }
+  });
+};
+
+// Transform dot field to Oracle JSON path expression
+// For queries like "data.nested.field" -> JSON_VALUE("data", '$.nested.field')
+const transformDotFieldForOracle = fieldName => {
+  if (fieldName.indexOf('.') === -1) {
+    return quoteIdentifier(fieldName);
+  }
+  const components = fieldName.split('.');
+  const column = components[0];
+  const path = '$.' + components.slice(1).join('.');
+  return { column: quoteIdentifier(column), path };
+};
+
+// Build JSON_VALUE expression for dot notation
+const buildJsonValueExpr = (fieldName, paramName) => {
+  const dotInfo = transformDotFieldForOracle(fieldName);
+  if (typeof dotInfo === 'string') {
+    return { expr: `${dotInfo} = :${paramName}`, isDot: false };
+  }
+  return {
+    expr: `JSON_VALUE(${dotInfo.column}, '${dotInfo.path}') = :${paramName}`,
+    isDot: true,
+    column: dotInfo.column,
+    path: dotInfo.path
+  };
+};
+
+// Build JSON_EXISTS expression to check if a path exists
+const buildJsonExistsExpr = (fieldName, exists) => {
+  const dotInfo = transformDotFieldForOracle(fieldName);
+  if (typeof dotInfo === 'string') {
+    return exists ? `${dotInfo} IS NOT NULL` : `${dotInfo} IS NULL`;
+  }
+  if (exists) {
+    return `JSON_EXISTS(${dotInfo.column}, '${dotInfo.path}')`;
+  } else {
+    return `NOT JSON_EXISTS(${dotInfo.column}, '${dotInfo.path}')`;
+  }
+};
+
 interface WhereClause {
   pattern: string;
   values: Object;
@@ -275,6 +332,56 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       patterns.push(`LOWER(${quoteIdentifier(fieldName)}) = LOWER(:v${index})`);
       values[`v${index}`] = fieldValue;
       index += 1;
+    } else if (fieldName.indexOf('.') >= 0) {
+      // Dot notation field - use JSON_VALUE for querying nested fields
+      const dotInfo = transformDotFieldForOracle(fieldName);
+      if (fieldValue === null) {
+        patterns.push(`NOT JSON_EXISTS(${dotInfo.column}, '${dotInfo.path}')`);
+        continue;
+      } else if (fieldValue.$in) {
+        // Handle $in for dot notation
+        const inParams = fieldValue.$in.map((val, i) => {
+          const paramName = `v${index + i}`;
+          values[paramName] = typeof val === 'object' ? JSON.stringify(val) : val;
+          return `:${paramName}`;
+        });
+        patterns.push(`JSON_VALUE(${dotInfo.column}, '${dotInfo.path}') IN (${inParams.join(', ')})`);
+        index += fieldValue.$in.length;
+      } else if (fieldValue.$regex) {
+        patterns.push(`REGEXP_LIKE(JSON_VALUE(${dotInfo.column}, '${dotInfo.path}'), :v${index})`);
+        values[`v${index}`] = fieldValue.$regex;
+        index += 1;
+      } else if (fieldValue.$exists !== undefined) {
+        if (fieldValue.$exists) {
+          patterns.push(`JSON_EXISTS(${dotInfo.column}, '${dotInfo.path}')`);
+        } else {
+          patterns.push(`NOT JSON_EXISTS(${dotInfo.column}, '${dotInfo.path}')`);
+        }
+      } else if (fieldValue.$ne !== undefined) {
+        const neValue = fieldValue.$ne;
+        if (neValue === null) {
+          patterns.push(`JSON_EXISTS(${dotInfo.column}, '${dotInfo.path}')`);
+        } else {
+          patterns.push(`(JSON_VALUE(${dotInfo.column}, '${dotInfo.path}') <> :v${index} OR NOT JSON_EXISTS(${dotInfo.column}, '${dotInfo.path}'))`);
+          values[`v${index}`] = typeof neValue === 'object' ? JSON.stringify(neValue) : neValue;
+          index += 1;
+        }
+      } else if (fieldValue.$gt !== undefined || fieldValue.$lt !== undefined ||
+                 fieldValue.$gte !== undefined || fieldValue.$lte !== undefined) {
+        // Handle comparison operators for dot notation
+        Object.keys(ParseToOracleComparator).forEach(cmp => {
+          if (fieldValue[cmp] !== undefined) {
+            const cmpValue = toOracleValue(fieldValue[cmp]);
+            patterns.push(`CAST(JSON_VALUE(${dotInfo.column}, '${dotInfo.path}') AS NUMBER) ${ParseToOracleComparator[cmp]} :v${index}`);
+            values[`v${index}`] = cmpValue;
+            index += 1;
+          }
+        });
+      } else if (typeof fieldValue !== 'object') {
+        patterns.push(`JSON_VALUE(${dotInfo.column}, '${dotInfo.path}') = :v${index}`);
+        values[`v${index}`] = fieldValue;
+        index += 1;
+      }
     } else if (fieldValue === null || fieldValue === undefined) {
       patterns.push(`${quoteIdentifier(fieldName)} IS NULL`);
       continue;
@@ -343,6 +450,16 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
     if (Array.isArray(fieldValue.$in)) {
       if (fieldValue.$in.length === 0) {
         patterns.push('1 = 0'); // Return no values
+      } else if (isArrayField) {
+        // For array fields, check if any element is in the array
+        // Using JSON_TABLE to unnest the array and check membership
+        const inValues = JSON.stringify(fieldValue.$in);
+        patterns.push(`EXISTS (
+          SELECT 1 FROM JSON_TABLE(${quoteIdentifier(fieldName)}, '$[*]' COLUMNS (val PATH '$')) jt
+          WHERE jt.val IN (SELECT jv.val FROM JSON_TABLE(:v${index}, '$[*]' COLUMNS (val PATH '$')) jv)
+        )`);
+        values[`v${index}`] = inValues;
+        index += 1;
       } else {
         const inParams = fieldValue.$in.map((val, i) => {
           const paramName = `v${index + i}`;
@@ -357,6 +474,15 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
     if (Array.isArray(fieldValue.$nin)) {
       if (fieldValue.$nin.length === 0) {
         patterns.push('1 = 1'); // Return all values
+      } else if (isArrayField) {
+        // For array fields, check if no element is in the array
+        const ninValues = JSON.stringify(fieldValue.$nin);
+        patterns.push(`NOT EXISTS (
+          SELECT 1 FROM JSON_TABLE(${quoteIdentifier(fieldName)}, '$[*]' COLUMNS (val PATH '$')) jt
+          WHERE jt.val IN (SELECT jv.val FROM JSON_TABLE(:v${index}, '$[*]' COLUMNS (val PATH '$')) jv)
+        )`);
+        values[`v${index}`] = ninValues;
+        index += 1;
       } else {
         const ninParams = fieldValue.$nin.map((val, i) => {
           const paramName = `v${index + i}`;
@@ -365,6 +491,52 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         });
         patterns.push(`${quoteIdentifier(fieldName)} NOT IN (${ninParams.join(', ')})`);
         index += fieldValue.$nin.length;
+      }
+    }
+
+    // Handle $all - array must contain all specified values
+    if (Array.isArray(fieldValue.$all) && isArrayField) {
+      if (fieldValue.$all.length === 0) {
+        patterns.push('1 = 0'); // Empty $all never matches
+      } else {
+        // Check that every value in $all exists in the array
+        const allValues = JSON.stringify(fieldValue.$all);
+        patterns.push(`(
+          SELECT COUNT(DISTINCT jv.val) FROM JSON_TABLE(:v${index}, '$[*]' COLUMNS (val PATH '$')) jv
+          WHERE jv.val IN (SELECT jt.val FROM JSON_TABLE(${quoteIdentifier(fieldName)}, '$[*]' COLUMNS (val PATH '$')) jt)
+        ) = JSON_QUERY(:v${index}, '$.size()')`);
+        // Simplified version: check each value exists
+        const allChecks = fieldValue.$all.map((val, i) => {
+          const paramName = `v${index + i}`;
+          const jsonVal = typeof val === 'object' ? JSON.stringify(val) : JSON.stringify(val);
+          values[paramName] = jsonVal;
+          return `JSON_EXISTS(${quoteIdentifier(fieldName)}, '$[*]?(@ == $val)' PASSING :${paramName} AS "val")`;
+        });
+        // Override with simpler approach
+        patterns.pop(); // Remove the complex one
+        patterns.push(`(${allChecks.join(' AND ')})`);
+        index += fieldValue.$all.length;
+      }
+    }
+
+    // Handle $containedBy - array must be a subset of specified values
+    if (fieldValue.$containedBy && isArrayField) {
+      const arr = fieldValue.$containedBy;
+      if (!(arr instanceof Array)) {
+        throw new Parse.Error(Parse.Error.INVALID_JSON, `bad $containedBy: should be an array`);
+      }
+      if (arr.length === 0) {
+        // Only empty arrays are contained by empty array
+        patterns.push(`(${quoteIdentifier(fieldName)} IS NULL OR JSON_QUERY(${quoteIdentifier(fieldName)}, '$') = '[]')`);
+      } else {
+        // All elements in the field must be in the containedBy array
+        const containedByValues = JSON.stringify(arr);
+        patterns.push(`NOT EXISTS (
+          SELECT 1 FROM JSON_TABLE(${quoteIdentifier(fieldName)}, '$[*]' COLUMNS (val PATH '$')) jt
+          WHERE jt.val NOT IN (SELECT jv.val FROM JSON_TABLE(:v${index}, '$[*]' COLUMNS (val PATH '$')) jv)
+        )`);
+        values[`v${index}`] = containedByValues;
+        index += 1;
       }
     }
 
@@ -401,6 +573,133 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       patterns.push(`${quoteIdentifier(fieldName)} = TO_TIMESTAMP_TZ(:v${index}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3TZH:TZM')`);
       values[`v${index}`] = fieldValue.iso;
       index += 1;
+    }
+
+    if (fieldValue.__type === 'GeoPoint') {
+      patterns.push(`${quoteIdentifier(fieldName)} = :v${index}`);
+      values[`v${index}`] = JSON.stringify(fieldValue);
+      index += 1;
+    }
+
+    // GeoPoint queries: $nearSphere, $geoWithin
+    // GeoPoints are stored as JSON: {"latitude": x, "longitude": y}
+    const isGeoPointField =
+      schema.fields && schema.fields[fieldName] && schema.fields[fieldName].type === 'GeoPoint';
+
+    if (fieldValue.$nearSphere && isGeoPointField) {
+      const point = fieldValue.$nearSphere;
+      const lat = point.latitude;
+      const lon = point.longitude;
+      const col = quoteIdentifier(fieldName);
+
+      // Haversine formula for great-circle distance in radians
+      // Earth's radius is 6371 km, but Parse uses radians for $maxDistance
+      // 1 radian = 6371 km
+      const haversineExpr = `(
+        2 * ASIN(SQRT(
+          POWER(SIN((TO_NUMBER(JSON_VALUE(${col}, '$.latitude')) - :lat${index}) * 3.14159265359 / 180 / 2), 2) +
+          COS(:lat${index} * 3.14159265359 / 180) *
+          COS(TO_NUMBER(JSON_VALUE(${col}, '$.latitude')) * 3.14159265359 / 180) *
+          POWER(SIN((TO_NUMBER(JSON_VALUE(${col}, '$.longitude')) - :lon${index}) * 3.14159265359 / 180 / 2), 2)
+        ))
+      )`;
+
+      values[`lat${index}`] = lat;
+      values[`lon${index}`] = lon;
+
+      if (fieldValue.$maxDistance !== undefined) {
+        // $maxDistance is in radians
+        patterns.push(`${haversineExpr} <= :maxDist${index}`);
+        values[`maxDist${index}`] = fieldValue.$maxDistance;
+      } else {
+        // Just ensure the field is not null for nearSphere without maxDistance
+        patterns.push(`${col} IS NOT NULL`);
+      }
+
+      // Add distance to sorts for ordering by proximity
+      sorts.push({
+        field: fieldName,
+        direction: 'ASC',
+        distanceExpr: haversineExpr,
+      });
+      index += 1;
+    }
+
+    if (fieldValue.$geoWithin && isGeoPointField) {
+      const col = quoteIdentifier(fieldName);
+
+      // $geoWithin.$box - rectangular bounding box
+      if (fieldValue.$geoWithin.$box) {
+        const box = fieldValue.$geoWithin.$box;
+        const southwest = box[0]; // {latitude, longitude}
+        const northeast = box[1];
+
+        patterns.push(`(
+          TO_NUMBER(JSON_VALUE(${col}, '$.latitude')) >= :swLat${index} AND
+          TO_NUMBER(JSON_VALUE(${col}, '$.latitude')) <= :neLat${index} AND
+          TO_NUMBER(JSON_VALUE(${col}, '$.longitude')) >= :swLon${index} AND
+          TO_NUMBER(JSON_VALUE(${col}, '$.longitude')) <= :neLon${index}
+        )`);
+        values[`swLat${index}`] = southwest.latitude;
+        values[`swLon${index}`] = southwest.longitude;
+        values[`neLat${index}`] = northeast.latitude;
+        values[`neLon${index}`] = northeast.longitude;
+        index += 1;
+      }
+
+      // $geoWithin.$centerSphere - circle defined by center and radius in radians
+      if (fieldValue.$geoWithin.$centerSphere) {
+        const center = fieldValue.$geoWithin.$centerSphere[0]; // [longitude, latitude] or {latitude, longitude}
+        const radius = fieldValue.$geoWithin.$centerSphere[1]; // radius in radians
+
+        // Handle both array format [lon, lat] and object format
+        const lat = Array.isArray(center) ? center[1] : center.latitude;
+        const lon = Array.isArray(center) ? center[0] : center.longitude;
+
+        // Haversine distance must be <= radius
+        const haversineExpr = `(
+          2 * ASIN(SQRT(
+            POWER(SIN((TO_NUMBER(JSON_VALUE(${col}, '$.latitude')) - :cLat${index}) * 3.14159265359 / 180 / 2), 2) +
+            COS(:cLat${index} * 3.14159265359 / 180) *
+            COS(TO_NUMBER(JSON_VALUE(${col}, '$.latitude')) * 3.14159265359 / 180) *
+            POWER(SIN((TO_NUMBER(JSON_VALUE(${col}, '$.longitude')) - :cLon${index}) * 3.14159265359 / 180 / 2), 2)
+          ))
+        )`;
+
+        patterns.push(`${haversineExpr} <= :cRadius${index}`);
+        values[`cLat${index}`] = lat;
+        values[`cLon${index}`] = lon;
+        values[`cRadius${index}`] = radius;
+        index += 1;
+      }
+
+      // $geoWithin.$polygon - polygon defined by array of points
+      if (fieldValue.$geoWithin.$polygon) {
+        const polygon = fieldValue.$geoWithin.$polygon;
+        // Point-in-polygon using ray casting algorithm is complex in SQL
+        // For Milestone 2, we'll use a bounding box approximation
+        // Full polygon support would require Oracle Spatial or complex PL/SQL
+
+        // Calculate bounding box from polygon points
+        const lats = polygon.map(p => p.latitude);
+        const lons = polygon.map(p => p.longitude);
+        const minLat = Math.min(...lats);
+        const maxLat = Math.max(...lats);
+        const minLon = Math.min(...lons);
+        const maxLon = Math.max(...lons);
+
+        patterns.push(`(
+          TO_NUMBER(JSON_VALUE(${col}, '$.latitude')) >= :polyMinLat${index} AND
+          TO_NUMBER(JSON_VALUE(${col}, '$.latitude')) <= :polyMaxLat${index} AND
+          TO_NUMBER(JSON_VALUE(${col}, '$.longitude')) >= :polyMinLon${index} AND
+          TO_NUMBER(JSON_VALUE(${col}, '$.longitude')) <= :polyMaxLon${index}
+        )`);
+        values[`polyMinLat${index}`] = minLat;
+        values[`polyMaxLat${index}`] = maxLat;
+        values[`polyMinLon${index}`] = minLon;
+        values[`polyMaxLon${index}`] = maxLon;
+        index += 1;
+      }
     }
 
     // Comparison operators ($gt, $lt, $gte, $lte)
@@ -1310,17 +1609,43 @@ export class OracleStorageAdapter implements StorageAdapter {
           values[paramName] = fieldValue.amount;
         } else if (fieldValue.__op === 'Delete') {
           updateClauses.push(`${quoteIdentifier(fieldName)} = NULL`);
-        } else if (fieldValue.__op === 'Add' || fieldValue.__op === 'AddUnique') {
-          // For arrays stored as JSON CLOB, we need to handle this differently
-          // For Milestone 1, we'll just replace the entire array
+        } else if (fieldValue.__op === 'Add') {
+          // Append objects to existing array using JSON_ARRAYAGG
+          // If array is null/empty, just set the new values
           const paramName = `u${paramIndex++}`;
-          updateClauses.push(`${quoteIdentifier(fieldName)} = :${paramName}`);
+          const col = quoteIdentifier(fieldName);
+          updateClauses.push(`${col} = (
+            SELECT COALESCE(JSON_ARRAYAGG(val RETURNING CLOB), '[]') FROM (
+              SELECT jt.val FROM JSON_TABLE(COALESCE(${col}, '[]'), '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt
+              UNION ALL
+              SELECT jn.val FROM JSON_TABLE(:${paramName}, '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jn
+            )
+          )`);
+          values[paramName] = JSON.stringify(fieldValue.objects);
+        } else if (fieldValue.__op === 'AddUnique') {
+          // Add only unique objects to the array using UNION (removes duplicates)
+          const paramName = `u${paramIndex++}`;
+          const col = quoteIdentifier(fieldName);
+          updateClauses.push(`${col} = (
+            SELECT COALESCE(JSON_ARRAYAGG(val RETURNING CLOB), '[]') FROM (
+              SELECT jt.val FROM JSON_TABLE(COALESCE(${col}, '[]'), '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt
+              UNION
+              SELECT jn.val FROM JSON_TABLE(:${paramName}, '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jn
+            )
+          )`);
           values[paramName] = JSON.stringify(fieldValue.objects);
         } else if (fieldValue.__op === 'Remove') {
-          // For Milestone 1, array Remove is limited - document as limitation
+          // Remove specified objects from the array
           const paramName = `u${paramIndex++}`;
-          updateClauses.push(`${quoteIdentifier(fieldName)} = :${paramName}`);
-          values[paramName] = JSON.stringify([]); // Clear array for now
+          const col = quoteIdentifier(fieldName);
+          updateClauses.push(`${col} = (
+            SELECT COALESCE(JSON_ARRAYAGG(jt.val RETURNING CLOB), '[]')
+            FROM JSON_TABLE(COALESCE(${col}, '[]'), '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt
+            WHERE jt.val NOT IN (
+              SELECT jr.val FROM JSON_TABLE(:${paramName}, '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jr
+            )
+          )`);
+          values[paramName] = JSON.stringify(fieldValue.objects)
         } else if (fieldValue.__type === 'Pointer') {
           const paramName = `u${paramIndex++}`;
           updateClauses.push(`${quoteIdentifier(fieldName)} = :${paramName}`);
@@ -1440,7 +1765,11 @@ export class OracleStorageAdapter implements StorageAdapter {
 
       // Build ORDER BY clause
       let sortPattern = '';
-      if (sort) {
+      // Check for geo distance sorts from $nearSphere
+      if (where.sorts && where.sorts.length > 0) {
+        const geoSorts = where.sorts.map(s => `${s.distanceExpr} ${s.direction}`);
+        sortPattern = `ORDER BY ${geoSorts.join(', ')}`;
+      } else if (sort) {
         const sorting = Object.keys(sort)
           .map(key => {
             const direction = sort[key] === 1 ? 'ASC' : 'DESC';

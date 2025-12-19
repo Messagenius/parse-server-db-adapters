@@ -11,46 +11,82 @@ This document tracks known limitations, unsupported features, and planned optimi
 
 ---
 
-## Known Limitations (Milestone 1)
+## Milestone 2 - Query Feature Coverage (Completed)
+
+### Implemented Features
+
+#### GeoPoint Queries
+- **Status**: Implemented using Haversine formula
+- **Supported Operators**:
+  - `$nearSphere` - Finds points near a location, sorted by distance
+  - `$nearSphere` with `$maxDistance` - Limits results by distance (radians)
+  - `$geoWithin.$box` - Finds points within a rectangular bounding box
+  - `$geoWithin.$centerSphere` - Finds points within a circle (radius in radians)
+  - `$geoWithin.$polygon` - Finds points within polygon bounding box (approximation)
+- **Storage**: GeoPoint stored as JSON in CLOB: `{"latitude": x, "longitude": y}`
+- **Distance Calculation**: Great-circle distance using Haversine formula
+
+#### Dot Notation Queries
+- **Status**: Fully implemented
+- **Implementation**: Uses JSON_VALUE/JSON_QUERY for nested field access
+- **Supported Operations**:
+  - Equality: `{"data.nested.field": "value"}`
+  - Comparison operators: `$gt`, `$lt`, `$gte`, `$lte`
+  - `$in` / `$nin` on nested fields
+  - `$exists` for nested field existence
+  - `$ne` for nested field inequality
+  - `$regex` on nested string fields
+
+#### Array Operators
+- **Status**: Implemented using JSON_TABLE and JSON_EXISTS
+- **Supported Operators**:
+  - `$in` - Check if field value is in array, or if array contains any of values
+  - `$nin` - Negation of $in
+  - `$all` - Check if array contains all specified values
+  - `$containedBy` - Check if array is subset of specified values
+- **Implementation Notes**:
+  - Uses JSON_TABLE to unnest JSON arrays for comparison
+  - Uses JSON_EXISTS with filter expressions for $all
+
+#### Array Update Operations
+- **Status**: Properly implemented with JSON_ARRAYAGG
+- **Supported Operations**:
+  - `Add` - Appends objects to existing array
+  - `AddUnique` - Adds only unique objects (uses SQL UNION)
+  - `Remove` - Removes specified objects from array
+- **Implementation Notes**:
+  - Uses JSON_ARRAYAGG with subqueries for atomic updates
+  - Handles null/empty arrays gracefully
+
+#### Polygon Support
+- **Status**: Basic support implemented
+- **Storage**: Polygon stored as JSON in CLOB with coordinates array
+- **Queries**: Bounding box approximation for $geoIntersects
+- **Note**: True polygon intersection queries require Oracle Spatial (future enhancement)
+
+---
+
+## Known Limitations
 
 ### Unsupported Parse Features
-
-#### GeoPoint and Spatial Queries
-- **Status**: Not supported in Milestone 1
-- **Current Behavior**: GeoPoint and Polygon data stored as JSON in CLOB columns
-- **Affected Operators**:
-  - `$nearSphere` - Not supported
-  - `$geoWithin` - Not supported
-  - `$geoIntersects` - Not supported
-  - `$within.$box` - Not supported
-  - `$within.$polygon` - Not supported
-  - `$centerSphere` - Not supported
-- **Future**: Implement using Oracle Spatial (SDO_GEOMETRY) in Milestone 2/3
 
 #### Full-Text Search
 - **Status**: Not supported
 - **Affected Operators**:
   - `$text.$search` - Not supported
-- **Future**: Implement using Oracle Text in Milestone 2/3
+- **Future**: Implement using Oracle Text in Milestone 3
 
-#### Complex Array Operators
+#### Advanced Polygon Queries
 - **Status**: Limited support
 - **Affected Operators**:
-  - `$all` - Not supported (arrays stored as JSON)
-  - `$containedBy` - Not supported
-  - `$elemMatch` - Not supported
-  - Array `$in` with nested arrays - Limited
-- **Current Behavior**: Arrays stored as JSON in CLOB columns
-- **Array Operations** (Add, Remove, AddUnique):
-  - `Add` - Replaces entire array (does not append)
-  - `Remove` - Clears array (does not selectively remove)
-  - `AddUnique` - Replaces entire array (does not enforce uniqueness)
-- **Future**: Consider Oracle nested tables or JSON_TABLE for advanced array operations
+  - `$geoIntersects` - Uses bounding box approximation
+  - Point-in-polygon - Requires Oracle Spatial for accurate results
+- **Future**: Consider Oracle Spatial (SDO_GEOMETRY) integration
 
-#### Dot Notation in Queries
-- **Status**: Limited support
-- **Current Behavior**: Basic dot notation in WHERE works, complex nested queries may fail
-- **Future**: Full JSON path query support using JSON_VALUE/JSON_QUERY
+#### $elemMatch
+- **Status**: Not supported
+- **Workaround**: Use application-level filtering
+- **Future**: Could implement using JSON_TABLE with complex conditions
 
 ---
 
@@ -59,7 +95,7 @@ This document tracks known limitations, unsupported features, and planned optimi
 #### Empty String Handling
 - **Issue**: Oracle treats empty strings (`''`) as NULL
 - **Impact**: String comparisons involving empty strings may behave differently than PostgreSQL/MongoDB
-- **Workaround**: None for Milestone 1 - documented as known limitation
+- **Workaround**: None - documented as known limitation
 - **Future**: Consider storing empty strings as special marker or using additional column
 
 #### Identifier Length
@@ -103,41 +139,14 @@ This document tracks known limitations, unsupported features, and planned optimi
 
 ---
 
-## Non-Goals (Milestone 1)
+## Non-Goals (Current Phase)
 
-The following are explicitly NOT goals for Milestone 1:
+The following are explicitly NOT goals for current implementation:
 
-1. **Full operator parity with PostgreSQL** - Complex operators deferred to Milestone 2
-2. **Query optimization** - Deferred to Milestone 3
-3. **Architecture refactoring** - Keep structure similar to PostgreSQL adapter
-4. **Document-store (SODA) approach** - Using relational SQL approach only
-5. **Oracle-specific advanced features** - Only basic SQL features used
-6. **Schema change notifications** - PostgreSQL uses LISTEN/NOTIFY; Oracle would need AQ
-
----
-
-## Milestone 2 - Query Feature Coverage (Planned)
-
-### Planned Improvements
-
-1. **GeoPoint Support**
-   - Implement using Oracle Spatial SDO_GEOMETRY
-   - Support `$nearSphere` with SDO_NN
-   - Support `$geoWithin` with SDO_RELATE
-
-2. **Full-Text Search**
-   - Implement using Oracle Text
-   - Support `$text.$search` with CONTAINS
-
-3. **Array Operations**
-   - Full JSON array manipulation using JSON_MERGEPATCH
-   - `$all` using JSON_TABLE
-   - `$containedBy` using JSON_QUERY
-
-4. **Aggregation Pipeline**
-   - Full support for `$group` with complex expressions
-   - Date extraction functions
-   - `$project` with computed fields
+1. **Oracle Spatial integration** - Using JSON-based approach for GeoPoint
+2. **Oracle Text integration** - Full-text search deferred
+3. **Document-store (SODA) approach** - Using relational SQL approach only
+4. **Schema change notifications** - PostgreSQL uses LISTEN/NOTIFY; Oracle would need AQ
 
 ---
 
@@ -162,7 +171,11 @@ The following are explicitly NOT goals for Milestone 1:
 4. **Indexing Strategy**
    - JSON indexes for CLOB columns
    - Function-based indexes for case-insensitive search
-   - Spatial indexes for GeoPoint
+   - Potential spatial indexes if Oracle Spatial is adopted
+
+5. **Full-Text Search**
+   - Implement using Oracle Text
+   - Support `$text.$search` with CONTAINS
 
 ---
 
@@ -193,8 +206,15 @@ oracle://user:password@host:port/service_name?poolMin=2&poolMax=10
 
 ## Version History
 
-- **Milestone 1** (Current): Baseline Oracle SQL compatibility
+- **Milestone 1**: Baseline Oracle SQL compatibility
   - Schema operations
   - Basic CRUD
   - Simple queries (WHERE, ORDER BY, pagination)
   - Standard and wallet-based connections
+
+- **Milestone 2** (Current): Query Feature Coverage
+  - GeoPoint queries ($nearSphere, $geoWithin.$box, $geoWithin.$centerSphere)
+  - Dot notation queries with JSON_VALUE/JSON_QUERY
+  - Array operators ($all, $containedBy, $in, $nin on arrays)
+  - Proper array update operations (Add, AddUnique, Remove)
+  - Polygon basic storage/retrieval

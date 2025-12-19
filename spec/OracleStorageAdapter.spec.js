@@ -458,6 +458,239 @@ describe_only_db('oracle')('OracleStorageAdapter', () => {
     expect(result.get('data')).toEqual(testObject);
     expect(result.get('items')).toEqual(testArray);
   });
+
+  // Milestone 2: Dot notation queries
+  it('should handle dot notation queries on nested objects', async () => {
+    await adapter.deleteAllClasses();
+    const config = Config.get('test');
+    config.schemaCache.clear();
+    await adapter.performInitialization({ VolatileClassesSchemas: [] });
+
+    const database = Config.get(Parse.applicationId).database;
+    await database.loadSchema({ clearCache: true });
+
+    const obj1 = new Parse.Object('DotClass');
+    obj1.set('data', { nested: { value: 'target' }, other: 'data1' });
+    await obj1.save();
+
+    const obj2 = new Parse.Object('DotClass');
+    obj2.set('data', { nested: { value: 'other' }, other: 'data2' });
+    await obj2.save();
+
+    const query = new Parse.Query('DotClass');
+    query.equalTo('data.nested.value', 'target');
+    const results = await query.find();
+
+    expect(results.length).toBe(1);
+    expect(results[0].get('data').nested.value).toBe('target');
+  });
+
+  // Milestone 2: $all array operator
+  it('should handle $all queries on arrays', async () => {
+    await adapter.deleteAllClasses();
+    const config = Config.get('test');
+    config.schemaCache.clear();
+    await adapter.performInitialization({ VolatileClassesSchemas: [] });
+
+    const database = Config.get(Parse.applicationId).database;
+    await database.loadSchema({ clearCache: true });
+
+    const obj1 = new Parse.Object('TagClass');
+    obj1.set('tags', ['red', 'blue', 'green']);
+    await obj1.save();
+
+    const obj2 = new Parse.Object('TagClass');
+    obj2.set('tags', ['red', 'yellow']);
+    await obj2.save();
+
+    const obj3 = new Parse.Object('TagClass');
+    obj3.set('tags', ['blue', 'green', 'red', 'purple']);
+    await obj3.save();
+
+    const query = new Parse.Query('TagClass');
+    query.containsAll('tags', ['red', 'blue']);
+    const results = await query.find();
+
+    expect(results.length).toBe(2);
+  });
+
+  // Milestone 2: Array Add operation
+  it('should handle array Add operation', async () => {
+    await adapter.deleteAllClasses();
+    const config = Config.get('test');
+    config.schemaCache.clear();
+    await adapter.performInitialization({ VolatileClassesSchemas: [] });
+
+    const database = Config.get(Parse.applicationId).database;
+    await database.loadSchema({ clearCache: true });
+
+    const obj = new Parse.Object('ArrayAddClass');
+    obj.set('items', ['a', 'b']);
+    await obj.save();
+
+    obj.add('items', 'c');
+    await obj.save();
+
+    const query = new Parse.Query('ArrayAddClass');
+    const result = await query.get(obj.id);
+
+    expect(result.get('items')).toContain('a');
+    expect(result.get('items')).toContain('b');
+    expect(result.get('items')).toContain('c');
+  });
+
+  // Milestone 2: Array AddUnique operation
+  it('should handle array AddUnique operation', async () => {
+    await adapter.deleteAllClasses();
+    const config = Config.get('test');
+    config.schemaCache.clear();
+    await adapter.performInitialization({ VolatileClassesSchemas: [] });
+
+    const database = Config.get(Parse.applicationId).database;
+    await database.loadSchema({ clearCache: true });
+
+    const obj = new Parse.Object('ArrayUniqueClass');
+    obj.set('items', ['a', 'b']);
+    await obj.save();
+
+    obj.addUnique('items', 'b'); // Already exists
+    obj.addUnique('items', 'c'); // New item
+    await obj.save();
+
+    const query = new Parse.Query('ArrayUniqueClass');
+    const result = await query.get(obj.id);
+
+    const items = result.get('items');
+    expect(items.length).toBe(3);
+    expect(items).toContain('a');
+    expect(items).toContain('b');
+    expect(items).toContain('c');
+  });
+
+  // Milestone 2: Array Remove operation
+  it('should handle array Remove operation', async () => {
+    await adapter.deleteAllClasses();
+    const config = Config.get('test');
+    config.schemaCache.clear();
+    await adapter.performInitialization({ VolatileClassesSchemas: [] });
+
+    const database = Config.get(Parse.applicationId).database;
+    await database.loadSchema({ clearCache: true });
+
+    const obj = new Parse.Object('ArrayRemoveClass');
+    obj.set('items', ['a', 'b', 'c', 'd']);
+    await obj.save();
+
+    obj.remove('items', 'b');
+    await obj.save();
+
+    const query = new Parse.Query('ArrayRemoveClass');
+    const result = await query.get(obj.id);
+
+    const items = result.get('items');
+    expect(items).toContain('a');
+    expect(items).not.toContain('b');
+    expect(items).toContain('c');
+    expect(items).toContain('d');
+  });
+
+  // Milestone 2: GeoPoint storage and retrieval
+  it('should handle GeoPoint storage and retrieval', async () => {
+    await adapter.deleteAllClasses();
+    const config = Config.get('test');
+    config.schemaCache.clear();
+    await adapter.performInitialization({ VolatileClassesSchemas: [] });
+
+    const database = Config.get(Parse.applicationId).database;
+    await database.loadSchema({ clearCache: true });
+
+    const point = new Parse.GeoPoint(37.7749, -122.4194); // San Francisco
+    const obj = new Parse.Object('PlaceClass');
+    obj.set('name', 'San Francisco');
+    obj.set('location', point);
+    await obj.save();
+
+    const query = new Parse.Query('PlaceClass');
+    const result = await query.get(obj.id);
+
+    const retrievedPoint = result.get('location');
+    expect(retrievedPoint.latitude).toBeCloseTo(37.7749, 4);
+    expect(retrievedPoint.longitude).toBeCloseTo(-122.4194, 4);
+  });
+
+  // Milestone 2: GeoPoint $nearSphere query
+  it('should handle $nearSphere queries', async () => {
+    await adapter.deleteAllClasses();
+    const config = Config.get('test');
+    config.schemaCache.clear();
+    await adapter.performInitialization({ VolatileClassesSchemas: [] });
+
+    const database = Config.get(Parse.applicationId).database;
+    await database.loadSchema({ clearCache: true });
+
+    // Create places at different distances
+    const sf = new Parse.Object('GeoClass');
+    sf.set('name', 'San Francisco');
+    sf.set('location', new Parse.GeoPoint(37.7749, -122.4194));
+    await sf.save();
+
+    const la = new Parse.Object('GeoClass');
+    la.set('name', 'Los Angeles');
+    la.set('location', new Parse.GeoPoint(34.0522, -118.2437));
+    await la.save();
+
+    const ny = new Parse.Object('GeoClass');
+    ny.set('name', 'New York');
+    ny.set('location', new Parse.GeoPoint(40.7128, -74.0060));
+    await ny.save();
+
+    // Query near San Francisco with max distance
+    const sfPoint = new Parse.GeoPoint(37.7749, -122.4194);
+    const query = new Parse.Query('GeoClass');
+    query.near('location', sfPoint);
+    query.withinRadians('location', sfPoint, 0.1); // ~600km
+
+    const results = await query.find();
+
+    // Should find SF and LA (within ~600km), but not NY (~4000km)
+    expect(results.length).toBe(2);
+    const names = results.map(r => r.get('name'));
+    expect(names).toContain('San Francisco');
+    expect(names).toContain('Los Angeles');
+  });
+
+  // Milestone 2: GeoPoint $geoWithin.$box query
+  it('should handle $geoWithin.$box queries', async () => {
+    await adapter.deleteAllClasses();
+    const config = Config.get('test');
+    config.schemaCache.clear();
+    await adapter.performInitialization({ VolatileClassesSchemas: [] });
+
+    const database = Config.get(Parse.applicationId).database;
+    await database.loadSchema({ clearCache: true });
+
+    const sf = new Parse.Object('BoxClass');
+    sf.set('name', 'San Francisco');
+    sf.set('location', new Parse.GeoPoint(37.7749, -122.4194));
+    await sf.save();
+
+    const ny = new Parse.Object('BoxClass');
+    ny.set('name', 'New York');
+    ny.set('location', new Parse.GeoPoint(40.7128, -74.0060));
+    await ny.save();
+
+    // Query within California bounding box
+    const southwest = new Parse.GeoPoint(32.0, -125.0);
+    const northeast = new Parse.GeoPoint(42.0, -114.0);
+
+    const query = new Parse.Query('BoxClass');
+    query.withinGeoBox('location', southwest, northeast);
+
+    const results = await query.find();
+
+    expect(results.length).toBe(1);
+    expect(results[0].get('name')).toBe('San Francisco');
+  });
 });
 
 describe_only_db('oracle')('OracleStorageAdapter shutdown', () => {
