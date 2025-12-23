@@ -285,6 +285,9 @@ const isArrayIndex = (str) => /^\d+$/.test(str);
 // Transform dot notation field to components for JSON access
 // e.g., "a.b.c" -> ['"a"', "'b'", "'c'"]
 const transformDotFieldToComponents = fieldName => {
+  if (!fieldName || typeof fieldName !== 'string') {
+    return [quoteIdentifier(fieldName || '')];
+  }
   return fieldName.split('.').map((cmpt, index) => {
     if (index === 0) {
       return quoteIdentifier(cmpt);
@@ -300,6 +303,9 @@ const transformDotFieldToComponents = fieldName => {
 // Transform dot field to Oracle JSON path expression
 // For queries like "data.nested.field" -> JSON_VALUE("data", '$.nested.field')
 const transformDotFieldForOracle = fieldName => {
+  if (!fieldName || typeof fieldName !== 'string') {
+    return quoteIdentifier(fieldName || '');
+  }
   if (fieldName.indexOf('.') === -1) {
     return quoteIdentifier(fieldName);
   }
@@ -2066,6 +2072,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         sortPattern = `ORDER BY ${geoSorts.join(', ')}`;
       } else if (sort) {
         const sorting = Object.keys(sort)
+          .filter(key => key != null && key !== '') // Filter out null/undefined/empty keys
           .map(key => {
             const direction = sort[key] === 1 ? 'ASC' : 'DESC';
             if (key.indexOf('.') >= 0) {
@@ -2085,7 +2092,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       // Build column selection
       let columns = '*';
       if (keys) {
-        keys = keys.reduce((memo, key) => {
+        keys = keys.filter(key => key != null).reduce((memo, key) => {
           if (key === 'ACL') {
             memo.push('_rperm');
             memo.push('_wperm');
@@ -2135,12 +2142,16 @@ export class OracleStorageAdapter implements StorageAdapter {
     const result = {};
     for (const key in object) {
       // Find the original field name (case-sensitive)
-      const fieldName = Object.keys(schema.fields).find(
+      const fieldName = schema.fields && Object.keys(schema.fields).find(
         f => f.toUpperCase() === key.toUpperCase()
       ) || key;
       result[fieldName] = object[key];
     }
     object = result;
+
+    if (!schema.fields) {
+      return object;
+    }
 
     Object.keys(schema.fields).forEach(fieldName => {
       const fieldType = schema.fields[fieldName].type;
