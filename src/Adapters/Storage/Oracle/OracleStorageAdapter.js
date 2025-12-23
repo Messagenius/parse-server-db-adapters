@@ -27,6 +27,8 @@ const debug = function (...args: any) {
   log.debug.apply(log, args);
 };
 
+const ORACLE_VARCHAR_MAX = 4000;
+
 // Map Parse types to Oracle SQL types
 const parseTypeToOracleType = type => {
   switch (type.type) {
@@ -37,11 +39,11 @@ const parseTypeToOracleType = type => {
     case 'Object':
       return 'CLOB'; // Store JSON as CLOB
     case 'File':
-      return 'VARCHAR2(4000)';
+      return 'VARCHAR2(1024)';
     case 'Boolean':
       return 'NUMBER(1)'; // Oracle has no boolean type for tables
     case 'Pointer':
-      return 'VARCHAR2(4000)';
+      return 'VARCHAR2(120)';
     case 'Number':
       return 'NUMBER';
     case 'GeoPoint':
@@ -116,6 +118,25 @@ const transformValue = value => {
     return value.objectId;
   }
   return value;
+};
+
+const ensureStringFits = (fieldName: string, value: any) => {
+  if (typeof value === 'string' && value.length > ORACLE_VARCHAR_MAX) {
+    throw new Parse.Error(
+      Parse.Error.INVALID_JSON,
+      `Field ${fieldName} exceeds Oracle VARCHAR2(${ORACLE_VARCHAR_MAX}) limit`
+    );
+  }
+};
+
+const normalizeQueryValue = (value: any) => {
+  if (value && value.__type === 'Date') {
+    return toOracleValue(value);
+  }
+  if (value && value.__type === 'File') {
+    return toOracleValue(value);
+  }
+  return transformValue(value);
 };
 
 // Convert boolean to Oracle NUMBER(1)
@@ -393,6 +414,13 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
 
   schema = toOracleSchema(schema);
   for (const fieldName in query) {
+    if (fieldName === '$text') {
+      throw new Parse.Error(
+        Parse.Error.OPERATION_FORBIDDEN,
+        'Oracle adapter does not support $text search; use $regex or add Oracle Text in Milestone 3.'
+      );
+    }
+
     const isArrayField =
       schema.fields && schema.fields[fieldName] && schema.fields[fieldName].type === 'Array';
     const initialPatternsLength = patterns.length;
@@ -430,7 +458,14 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         patterns.push(`JSON_VALUE(${dotInfo.column}, '${dotInfo.path}') IN (${inParams.join(', ')})`);
         index += fieldValue.$in.length;
       } else if (fieldValue.$regex) {
-        patterns.push(`REGEXP_LIKE(JSON_VALUE(${dotInfo.column}, '${dotInfo.path}'), :v${index})`);
+        let flags = '';
+        const opts = fieldValue.$options;
+        if (opts && opts.indexOf('i') >= 0) {
+          flags = 'i';
+        }
+        patterns.push(
+          `REGEXP_LIKE(JSON_VALUE(${dotInfo.column}, '${dotInfo.path}'), :v${index}${flags ? `, '${flags}'` : ''})`
+        );
         values[`v${index}`] = fieldValue.$regex;
         index += 1;
       } else if (fieldValue.$exists !== undefined) {
@@ -533,7 +568,24 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         patterns.push(`${quoteIdentifier(fieldName)} IS NOT NULL`);
       } else {
         patterns.push(`(${quoteIdentifier(fieldName)} <> :v${index} OR ${quoteIdentifier(fieldName)} IS NULL)`);
-        values[`v${index}`] = fieldValue.$ne;
+        let neValue = fieldValue.$ne;
+        if (neValue && neValue.$relativeTime) {
+          if (schema.fields[fieldName].type !== 'Date') {
+            throw new Parse.Error(
+              Parse.Error.INVALID_JSON,
+              '$relativeTime can only be used with Date field'
+            );
+          }
+          const parserResult = Utils.relativeTimeToDate(neValue.$relativeTime);
+          if (parserResult.status !== 'success') {
+            throw new Parse.Error(
+              Parse.Error.INVALID_JSON,
+              `bad $relativeTime (${neValue.$relativeTime}) value. ${parserResult.info}`
+            );
+          }
+          neValue = toOracleValue(parserResult.result);
+        }
+        values[`v${index}`] = normalizeQueryValue(neValue);
         index += 1;
       }
     }
@@ -544,7 +596,24 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         patterns.push(`${quoteIdentifier(fieldName)} IS NULL`);
       } else {
         patterns.push(`${quoteIdentifier(fieldName)} = :v${index}`);
-        values[`v${index}`] = fieldValue.$eq;
+        let eqValue = fieldValue.$eq;
+        if (eqValue && eqValue.$relativeTime) {
+          if (schema.fields[fieldName].type !== 'Date') {
+            throw new Parse.Error(
+              Parse.Error.INVALID_JSON,
+              '$relativeTime can only be used with Date field'
+            );
+          }
+          const parserResult = Utils.relativeTimeToDate(eqValue.$relativeTime);
+          if (parserResult.status !== 'success') {
+            throw new Parse.Error(
+              Parse.Error.INVALID_JSON,
+              `bad $relativeTime (${eqValue.$relativeTime}) value. ${parserResult.info}`
+            );
+          }
+          eqValue = toOracleValue(parserResult.result);
+        }
+        values[`v${index}`] = normalizeQueryValue(eqValue);
         index += 1;
       }
     }
@@ -562,7 +631,7 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       } else {
         const inParams = fieldValue.$in.map((val, i) => {
           const paramName = `v${index + i}`;
-          values[paramName] = val;
+          values[paramName] = normalizeQueryValue(val);
           return `:${paramName}`;
         });
         patterns.push(`${quoteIdentifier(fieldName)} IN (${inParams.join(', ')})`);
@@ -582,7 +651,7 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       } else {
         const ninParams = fieldValue.$nin.map((val, i) => {
           const paramName = `v${index + i}`;
-          values[paramName] = val;
+          values[paramName] = normalizeQueryValue(val);
           return `:${paramName}`;
         });
         patterns.push(`${quoteIdentifier(fieldName)} NOT IN (${ninParams.join(', ')})`);
@@ -1235,7 +1304,8 @@ export class OracleStorageAdapter implements StorageAdapter {
         if (['_rperm', '_wperm'].indexOf(fieldName) >= 0) {
           parseType.contents = { type: 'String' };
         }
-        const oracleType = parseTypeToOracleType(parseType);
+        const oracleType =
+          fieldName === 'objectId' ? 'VARCHAR2(120)' : parseTypeToOracleType(parseType);
         columns.push(`${quoteIdentifier(fieldName)} ${oracleType}`);
 
         if (fieldName === 'objectId') {
@@ -1313,7 +1383,8 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     try {
       if (type.type !== 'Relation') {
-        const oracleType = parseTypeToOracleType(type);
+        const oracleType =
+          fieldName === 'objectId' ? 'VARCHAR2(120)' : parseTypeToOracleType(type);
         try {
           await conn.execute(
             `ALTER TABLE ${quoteIdentifier(className)} ADD ${quoteIdentifier(fieldName)} ${oracleType}`
@@ -1607,6 +1678,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           fieldName === '_perishable_token' ||
           fieldName === '_password_history'
         ) {
+          ensureStringFits(fieldName, object[fieldName]);
           values[paramName] = typeof object[fieldName] === 'object'
             ? JSON.stringify(object[fieldName])
             : object[fieldName];
@@ -1641,6 +1713,9 @@ export class OracleStorageAdapter implements StorageAdapter {
           values[paramName] = JSON.stringify(object[fieldName]);
           break;
         case 'String':
+          ensureStringFits(fieldName, object[fieldName]);
+          values[paramName] = object[fieldName];
+          break;
         case 'Number':
           values[paramName] = object[fieldName];
           break;
@@ -1648,6 +1723,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           values[paramName] = toOracleBoolean(object[fieldName]);
           break;
         case 'File':
+          ensureStringFits(fieldName, object[fieldName].name);
           values[paramName] = object[fieldName].name;
           break;
         case 'GeoPoint':
@@ -1870,6 +1946,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         } else if (fieldValue.__type === 'File') {
           const paramName = `u${paramIndex++}`;
           updateClauses.push(`${quoteIdentifier(fieldName)} = :${paramName}`);
+          ensureStringFits(fieldName, toOracleValue(fieldValue));
           values[paramName] = toOracleValue(fieldValue);
         } else if (fieldValue.__type === 'GeoPoint') {
           // Store as JSON for Milestone 1
@@ -1891,6 +1968,11 @@ export class OracleStorageAdapter implements StorageAdapter {
           const paramName = `u${paramIndex++}`;
           updateClauses.push(`${quoteIdentifier(fieldName)} = :${paramName}`);
           values[paramName] = JSON.stringify(fieldValue);
+        } else if (typeof fieldValue === 'string') {
+          const paramName = `u${paramIndex++}`;
+          ensureStringFits(fieldName, fieldValue);
+          updateClauses.push(`${quoteIdentifier(fieldName)} = :${paramName}`);
+          values[paramName] = fieldValue;
         } else if (typeof fieldValue === 'boolean') {
           const paramName = `u${paramIndex++}`;
           updateClauses.push(`${quoteIdentifier(fieldName)} = :${paramName}`);
@@ -1986,6 +2068,14 @@ export class OracleStorageAdapter implements StorageAdapter {
         const sorting = Object.keys(sort)
           .map(key => {
             const direction = sort[key] === 1 ? 'ASC' : 'DESC';
+            if (key.indexOf('.') >= 0) {
+              const dotInfo = transformDotFieldForOracle(key);
+              const expr =
+                typeof dotInfo === 'string'
+                  ? dotInfo
+                  : `JSON_VALUE(${dotInfo.column}, '${dotInfo.path}')`;
+              return `${expr} ${direction}`;
+            }
             return `${quoteIdentifier(key)} ${direction}`;
           })
           .join(', ');
@@ -2019,6 +2109,12 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
 
       const sql = `SELECT ${columns} FROM ${quoteIdentifier(className)} ${wherePattern} ${sortPattern} ${paginationPattern}`;
+
+      if (explain) {
+        await conn.execute(this.createExplainableQuery(sql), where.values);
+        const plan = await conn.execute(`SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL, NULL, 'BASIC'))`);
+        return plan.rows;
+      }
 
       const result = await conn.execute(sql, where.values);
 
