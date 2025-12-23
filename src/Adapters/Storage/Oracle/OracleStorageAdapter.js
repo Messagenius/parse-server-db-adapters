@@ -1276,14 +1276,22 @@ export class OracleStorageAdapter implements StorageAdapter {
       debug('Schema inserted successfully');
 
       await this.setIndexesWithSchemaFormat(className, schema.indexes || {}, {}, schema.fields, conn);
-      await conn.commit();
-      debug('createClass committed successfully');
+      
+      // Only commit if we own the connection (not part of a larger transaction)
+      if (shouldRelease) {
+        await conn.commit();
+        debug('createClass committed successfully');
+      } else {
+        debug('createClass skipping commit (part of larger transaction)');
+      }
 
-      this._notifySchemaChange();
       return toParseSchema(schema);
     } catch (err) {
       debug('createClass error:', err);
-      await conn.rollback();
+      // Only rollback if we own the connection
+      if (shouldRelease) {
+        await conn.rollback();
+      }
       if (err.errorNum === OracleUniqueConstraintViolation) {
         throw new Parse.Error(Parse.Error.DUPLICATE_VALUE, `Class ${className} already exists.`);
       }
@@ -1292,6 +1300,12 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (shouldRelease) {
         await conn.close();
       }
+    }
+    
+    // Notify schema change AFTER transaction completes (like PostgreSQL)
+    // Only notify if we committed (owned the connection)
+    if (shouldRelease) {
+      this._notifySchemaChange();
     }
   }
 
@@ -1403,6 +1417,7 @@ export class OracleStorageAdapter implements StorageAdapter {
 
   async addFieldIfNotExists(className: string, fieldName: string, type: any, conn: ?any) {
     debug('addFieldIfNotExists', className, fieldName, type);
+    // If no connection provided, manage our own transaction (like PostgreSQL tx pattern)
     const shouldRelease = !conn;
     conn = conn || (await this._getConnection());
 
@@ -1419,7 +1434,12 @@ export class OracleStorageAdapter implements StorageAdapter {
         } catch (error) {
           if (error.errorNum === OracleTableDoesNotExistError) {
             debug('Table does not exist, creating class:', className);
-            return this.createClass(className, { fields: { [fieldName]: type } }, conn);
+            // Table doesn't exist - create it with this field
+            // Call createClass WITHOUT conn to let it manage its own transaction
+            if (shouldRelease) {
+              await conn.close(); // Close our connection first
+            }
+            return this.createClass(className, { fields: { [fieldName]: type } });
           }
           if (error.errorNum !== OracleDuplicateColumnError) {
             debug('Error adding field:', error);
@@ -1445,7 +1465,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         }
       }
 
-      // Update schema in _SCHEMA table
+      // Check if field already exists in schema
       const schemaResult = await conn.execute(
         `SELECT "schema" FROM "_SCHEMA" WHERE "className" = :className`,
         { className }
@@ -1459,23 +1479,41 @@ export class OracleStorageAdapter implements StorageAdapter {
         }
         
         const existingSchema = JSON.parse(schemaData);
-        if (existingSchema.fields[fieldName]) {
-          throw 'Attempted to add a field that already exists';
-        }
-        existingSchema.fields[fieldName] = type;
+        if (existingSchema.fields && existingSchema.fields[fieldName]) {
+          // Field already exists, nothing to do
+          debug('Field already exists in schema:', fieldName);
+        } else {
+          // Add field to schema
+          if (!existingSchema.fields) {
+            existingSchema.fields = {};
+          }
+          existingSchema.fields[fieldName] = type;
 
-        await conn.execute(
-          `UPDATE "_SCHEMA" SET "schema" = :schema WHERE "className" = :className`,
-          { schema: JSON.stringify(existingSchema), className }
-        );
+          await conn.execute(
+            `UPDATE "_SCHEMA" SET "schema" = :schema WHERE "className" = :className`,
+            { schema: JSON.stringify(existingSchema), className }
+          );
+        }
       }
 
-      await conn.commit();
-      this._notifySchemaChange();
+      // Only commit if we own the connection (not part of a larger transaction)
+      if (shouldRelease) {
+        await conn.commit();
+      }
+    } catch (error) {
+      if (shouldRelease) {
+        await conn.rollback();
+      }
+      throw error;
     } finally {
       if (shouldRelease) {
         await conn.close();
       }
+    }
+    
+    // Notify schema change AFTER transaction completes (like PostgreSQL)
+    if (shouldRelease) {
+      this._notifySchemaChange();
     }
   }
 
@@ -1565,7 +1603,8 @@ export class OracleStorageAdapter implements StorageAdapter {
         return list.concat(joinTablesForSchema(schemaObj));
       }, Promise.resolve([]));
 
-      const classes = [
+      // System tables (no prefix)
+      const systemTables = [
         '_SCHEMA',
         '_PushStatus',
         '_JobStatus',
@@ -1575,12 +1614,15 @@ export class OracleStorageAdapter implements StorageAdapter {
         '_GraphQLConfig',
         '_Audience',
         '_Idempotency',
-        ...results.map(result => result.className),
-        ...joins,
       ];
 
+      // User tables (with prefix) and join tables (no prefix)
+      const userTables = results.map(result => this._prefixTableName(result.className));
+      const joinTables = joins; // Join tables don't use prefix
+
       // Drop all tables
-      for (const tableName of classes) {
+      const allTables = [...systemTables, ...userTables, ...joinTables];
+      for (const tableName of allTables) {
         try {
           await conn.execute(`DROP TABLE ${quoteIdentifier(tableName)}`);
         } catch (error) {
@@ -1640,17 +1682,32 @@ export class OracleStorageAdapter implements StorageAdapter {
     const conn = await this._getConnection();
     try {
       const result = await conn.execute('SELECT * FROM "_SCHEMA"');
+      debug('getAllClasses: Found', result.rows.length, 'classes');
+      
       const classes = await Promise.all(result.rows.map(async row => {
         // Handle CLOB - oracledb returns CLOBs as Lob objects
         let schemaData = row.schema;
-        if (schemaData && typeof schemaData === 'object' && schemaData.constructor.name === 'Lob') {
+        const isLob = schemaData && typeof schemaData === 'object' && schemaData.constructor.name === 'Lob';
+        debug('getAllClasses: Processing', row.className, 'isLob:', isLob);
+        
+        if (isLob) {
           schemaData = await schemaData.getData();
+          debug('getAllClasses: CLOB data length:', schemaData?.length);
         }
+        
         const schema = typeof schemaData === 'string' ? JSON.parse(schemaData) : schemaData;
-        return toParseSchema({ className: row.className, ...schema });
+        const parseSchema = toParseSchema({ className: row.className, ...schema });
+        debug('getAllClasses: Converted', row.className, 'fields:', Object.keys(parseSchema.fields || {}).length);
+        console.log('🔍 Schema for', row.className, ':', JSON.stringify(parseSchema.fields, null, 2));
+        return parseSchema;
       }));
+      
+      debug('getAllClasses: Returning', classes.length, 'classes:', classes.map(c => c.className).join(', '));
+      console.log('🔍 Oracle getAllClasses returning:', classes.length, 'classes');
+      console.log('🔍 Class names:', classes.map(c => c.className));
       return classes;
     } catch (error) {
+      debug('getAllClasses: Error:', error);
       if (error.errorNum === OracleTableDoesNotExistError) {
         return [];
       }
