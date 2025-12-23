@@ -1,5 +1,6 @@
 -- Function to check if array contains any of the given values
 -- Equivalent to PostgreSQL's array_contains function
+-- Note: VARCHAR2(32767) is the maximum size for PL/SQL VARCHAR2 in Oracle 12c+
 
 CREATE OR REPLACE FUNCTION parse_array_contains(
   p_array   IN CLOB,
@@ -10,10 +11,10 @@ IS
 BEGIN
   -- Count how many elements from p_array are in p_values
   SELECT COUNT(*) INTO v_count
-  FROM JSON_TABLE(COALESCE(p_array, '[]'), '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt
+  FROM JSON_TABLE(COALESCE(p_array, '[]'), '$[*]' COLUMNS (val VARCHAR2(32767) PATH '$')) jt
   WHERE jt.val IN (
     SELECT jv.val
-    FROM JSON_TABLE(COALESCE(p_values, '[]'), '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jv
+    FROM JSON_TABLE(COALESCE(p_values, '[]'), '$[*]' COLUMNS (val VARCHAR2(32767) PATH '$')) jv
   );
 
   -- Return 1 (true) if at least one match, 0 (false) otherwise

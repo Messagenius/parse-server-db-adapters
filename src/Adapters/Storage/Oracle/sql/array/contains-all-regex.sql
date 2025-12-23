@@ -1,5 +1,6 @@
 -- Function to check if array contains all values matching regex patterns
 -- Equivalent to PostgreSQL's array_contains_all_regex function
+-- Note: VARCHAR2(32767) is the maximum size for PL/SQL VARCHAR2 in Oracle 12c+
 
 CREATE OR REPLACE FUNCTION parse_array_contains_all_regex(
   p_array    IN CLOB,
@@ -11,7 +12,7 @@ IS
 BEGIN
   -- Get the count of patterns we're looking for
   SELECT COUNT(*) INTO v_patterns_count
-  FROM JSON_TABLE(COALESCE(p_patterns, '[]'), '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$'));
+  FROM JSON_TABLE(COALESCE(p_patterns, '[]'), '$[*]' COLUMNS (val VARCHAR2(32767) PATH '$'));
 
   -- If no patterns to check, return false
   IF v_patterns_count = 0 THEN
@@ -20,10 +21,10 @@ BEGIN
 
   -- Count how many patterns have at least one match in the array
   SELECT COUNT(DISTINCT jp.val) INTO v_match_count
-  FROM JSON_TABLE(COALESCE(p_patterns, '[]'), '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jp
+  FROM JSON_TABLE(COALESCE(p_patterns, '[]'), '$[*]' COLUMNS (val VARCHAR2(32767) PATH '$')) jp
   WHERE EXISTS (
     SELECT 1
-    FROM JSON_TABLE(COALESCE(p_array, '[]'), '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt
+    FROM JSON_TABLE(COALESCE(p_array, '[]'), '$[*]' COLUMNS (val VARCHAR2(32767) PATH '$')) jt
     WHERE REGEXP_LIKE(jt.val, jp.val)
   );
 

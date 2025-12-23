@@ -68,17 +68,22 @@ const ParseToOracleComparator = {
   $lte: '<=',
 };
 
-// Mongo aggregate date parts to Oracle EXTRACT
+// Mongo aggregate date parts to Oracle EXTRACT/TO_CHAR format
+// Oracle EXTRACT supports: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND
+// For others, we use TO_CHAR with format masks
 const mongoAggregateToOracle = {
-  $dayOfMonth: 'DAY',
-  $dayOfWeek: 'D', // Oracle uses D for day of week (1-7)
-  $dayOfYear: 'DDD',
-  $hour: 'HOUR',
-  $minute: 'MINUTE',
-  $second: 'SECOND',
-  $month: 'MONTH',
-  $week: 'WW',
-  $year: 'YEAR',
+  $dayOfMonth: { type: 'EXTRACT', value: 'DAY' },
+  $dayOfWeek: { type: 'TO_CHAR', value: 'D' }, // Oracle D: 1-7, Sunday=1
+  $dayOfYear: { type: 'TO_CHAR', value: 'DDD' },
+  $isoDayOfWeek: { type: 'TO_CHAR', value: 'D' }, // ISO day of week (adjusted)
+  $isoWeekYear: { type: 'TO_CHAR', value: 'IYYY' }, // ISO year
+  $hour: { type: 'EXTRACT', value: 'HOUR' },
+  $minute: { type: 'EXTRACT', value: 'MINUTE' },
+  $second: { type: 'EXTRACT', value: 'SECOND' },
+  $millisecond: { type: 'TO_CHAR', value: 'FF3' }, // milliseconds
+  $month: { type: 'EXTRACT', value: 'MONTH' },
+  $week: { type: 'TO_CHAR', value: 'IW' }, // ISO week
+  $year: { type: 'EXTRACT', value: 'YEAR' },
 };
 
 const toOracleValue = value => {
@@ -91,6 +96,19 @@ const toOracleValue = value => {
     }
   }
   return value;
+};
+
+// Get Oracle cast type for a value (used in dot notation comparisons)
+const toOracleValueCastType = value => {
+  const oracleValue = toOracleValue(value);
+  switch (typeof oracleValue) {
+    case 'number':
+      return 'NUMBER';
+    case 'boolean':
+      return 'NUMBER'; // Oracle doesn't have boolean, use NUMBER(1)
+    default:
+      return undefined;
+  }
 };
 
 const transformValue = value => {
@@ -284,6 +302,69 @@ const buildJsonValueExpr = (fieldName, paramName) => {
   };
 };
 
+// Helper functions for regex pattern detection (from PostgreSQL adapter)
+function isStartsWithRegex(value) {
+  if (!value || typeof value !== 'string' || !value.startsWith('^')) {
+    return false;
+  }
+  const matches = value.match(/\^\\Q.*\\E/);
+  return !!matches;
+}
+
+function isAllValuesRegexOrNone(values) {
+  if (!values || !Array.isArray(values) || values.length === 0) {
+    return true;
+  }
+  const firstValuesIsRegex = isStartsWithRegex(values[0].$regex);
+  if (values.length === 1) {
+    return firstValuesIsRegex;
+  }
+  for (let i = 1, length = values.length; i < length; ++i) {
+    if (firstValuesIsRegex !== isStartsWithRegex(values[i].$regex)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isAnyValueRegexStartsWith(values) {
+  return values.some(function (value) {
+    return isStartsWithRegex(value.$regex);
+  });
+}
+
+function processRegexPattern(s) {
+  if (s && s.startsWith('^')) {
+    return '^' + literalizeRegexPart(s.slice(1));
+  } else if (s && s.endsWith('$')) {
+    return literalizeRegexPart(s.slice(0, s.length - 1)) + '$';
+  }
+  return literalizeRegexPart(s);
+}
+
+function literalizeRegexPart(s) {
+  if (!s) return s;
+  const matcher1 = /\\Q((?!\\E).*)\\E$/;
+  const result1 = s.match(matcher1);
+  if (result1 && result1.length > 1 && result1.index > -1) {
+    const prefix = s.substring(0, result1.index);
+    const remaining = result1[1];
+    return literalizeRegexPart(prefix) + remaining;
+  }
+  const matcher2 = /\\Q((?!\\E).*)$/;
+  const result2 = s.match(matcher2);
+  if (result2 && result2.length > 1 && result2.index > -1) {
+    const prefix = s.substring(0, result2.index);
+    const remaining = result2[1];
+    return literalizeRegexPart(prefix) + remaining;
+  }
+  return s
+    .replace(/([^\\])(\\E)/, '$1')
+    .replace(/([^\\])(\\Q)/, '$1')
+    .replace(/^\\E/, '')
+    .replace(/^\\Q/, '');
+}
+
 // Build JSON_EXISTS expression to check if a path exists
 const buildJsonExistsExpr = (fieldName, exists) => {
   const dotInfo = transformDotFieldForOracle(fieldName);
@@ -373,11 +454,30 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         Object.keys(ParseToOracleComparator).forEach(cmp => {
           if (fieldValue[cmp] !== undefined) {
             const cmpValue = toOracleValue(fieldValue[cmp]);
-            patterns.push(`CAST(JSON_VALUE(${dotInfo.column}, '${dotInfo.path}') AS NUMBER) ${ParseToOracleComparator[cmp]} :v${index}`);
+            const castType = toOracleValueCastType(fieldValue[cmp]);
+            // Use appropriate casting based on value type
+            const jsonExpr = castType
+              ? `CAST(JSON_VALUE(${dotInfo.column}, '${dotInfo.path}') AS ${castType})`
+              : `JSON_VALUE(${dotInfo.column}, '${dotInfo.path}')`;
+            patterns.push(`${jsonExpr} ${ParseToOracleComparator[cmp]} :v${index}`);
             values[`v${index}`] = cmpValue;
             index += 1;
           }
         });
+      } else if (fieldValue.$eq !== undefined) {
+        // Handle $eq for dot notation
+        const eqValue = fieldValue.$eq;
+        if (eqValue === null) {
+          patterns.push(`NOT JSON_EXISTS(${dotInfo.column}, '${dotInfo.path}')`);
+        } else {
+          const castType = toOracleValueCastType(eqValue);
+          const jsonExpr = castType
+            ? `CAST(JSON_VALUE(${dotInfo.column}, '${dotInfo.path}') AS ${castType})`
+            : `JSON_VALUE(${dotInfo.column}, '${dotInfo.path}')`;
+          patterns.push(`${jsonExpr} = :v${index}`);
+          values[`v${index}`] = typeof eqValue === 'object' ? JSON.stringify(eqValue) : eqValue;
+          index += 1;
+        }
       } else if (typeof fieldValue !== 'object') {
         patterns.push(`JSON_VALUE(${dotInfo.column}, '${dotInfo.path}') = :v${index}`);
         values[`v${index}`] = fieldValue;
@@ -427,7 +527,8 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       patterns.push(`${not}(${clauses.join(orOrAnd)})`);
     }
 
-    if (fieldValue.$ne !== undefined) {
+    // Handle $ne for non-dot-notation fields (dot notation $ne is handled above)
+    if (fieldValue.$ne !== undefined && fieldName.indexOf('.') === -1) {
       if (fieldValue.$ne === null) {
         patterns.push(`${quoteIdentifier(fieldName)} IS NOT NULL`);
       } else {
@@ -437,7 +538,8 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       }
     }
 
-    if (fieldValue.$eq !== undefined) {
+    // Handle $eq for non-dot-notation fields
+    if (fieldValue.$eq !== undefined && fieldName.indexOf('.') === -1) {
       if (fieldValue.$eq === null) {
         patterns.push(`${quoteIdentifier(fieldName)} IS NULL`);
       } else {
@@ -447,8 +549,8 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       }
     }
 
-    // Handle $in and $nin
-    if (Array.isArray(fieldValue.$in)) {
+    // Handle $in and $nin for non-dot-notation fields (dot notation is handled above)
+    if (Array.isArray(fieldValue.$in) && fieldName.indexOf('.') === -1) {
       if (fieldValue.$in.length === 0) {
         patterns.push('1 = 0'); // Return no values
       } else if (isArrayField) {
@@ -468,7 +570,7 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       }
     }
 
-    if (Array.isArray(fieldValue.$nin)) {
+    if (Array.isArray(fieldValue.$nin) && fieldName.indexOf('.') === -1) {
       if (fieldValue.$nin.length === 0) {
         patterns.push('1 = 1'); // Return all values
       } else if (isArrayField) {
@@ -492,11 +594,34 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
     if (Array.isArray(fieldValue.$all) && isArrayField) {
       if (fieldValue.$all.length === 0) {
         patterns.push('1 = 0'); // Empty $all never matches
+      } else if (isAnyValueRegexStartsWith(fieldValue.$all)) {
+        // Handle regex pattern matching for $all
+        if (!isAllValuesRegexOrNone(fieldValue.$all)) {
+          throw new Parse.Error(
+            Parse.Error.INVALID_JSON,
+            'All $all values must be of regex type or none: ' + fieldValue.$all
+          );
+        }
+        // Process regex patterns - convert ^\\Q...\\E to pattern%
+        const processedValues = fieldValue.$all.map(item => {
+          const value = processRegexPattern(item.$regex);
+          return value.substring(1) + '%'; // Remove ^ and add %
+        });
+        patterns.push(`parse_array_contains_all_regex(${quoteIdentifier(fieldName)}, :v${index}) = 1`);
+        values[`v${index}`] = JSON.stringify(processedValues);
+        index += 1;
       } else {
         // Use stored function to check that all values exist in the array
         const allValues = JSON.stringify(fieldValue.$all);
         patterns.push(`parse_array_contains_all(${quoteIdentifier(fieldName)}, :v${index}) = 1`);
         values[`v${index}`] = allValues;
+        index += 1;
+      }
+    } else if (Array.isArray(fieldValue.$all)) {
+      // Handle non-array field $all (for pointer arrays)
+      if (fieldValue.$all.length === 1) {
+        patterns.push(`${quoteIdentifier(fieldName)} = :v${index}`);
+        values[`v${index}`] = fieldValue.$all[0].objectId;
         index += 1;
       }
     }
@@ -523,7 +648,8 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       }
     }
 
-    if (typeof fieldValue.$exists !== 'undefined') {
+    // Handle $exists for non-dot-notation fields (dot notation is handled above)
+    if (typeof fieldValue.$exists !== 'undefined' && fieldName.indexOf('.') === -1) {
       if (fieldValue.$exists) {
         patterns.push(`${quoteIdentifier(fieldName)} IS NOT NULL`);
       } else {
@@ -531,7 +657,8 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       }
     }
 
-    if (fieldValue.$regex) {
+    // Handle $regex for non-dot-notation fields (dot notation is handled above)
+    if (fieldValue.$regex && fieldName.indexOf('.') === -1) {
       // Oracle uses REGEXP_LIKE for regex matching
       let regex = fieldValue.$regex;
       let flags = '';
@@ -544,6 +671,15 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
       patterns.push(`REGEXP_LIKE(${quoteIdentifier(fieldName)}, :v${index}${flags ? `, '${flags}'` : ''})`);
       values[`v${index}`] = regex;
       index += 1;
+    }
+
+    // Handle $text - full-text search is not supported in Oracle adapter
+    // Fail gracefully with a clear error message
+    if (fieldValue.$text) {
+      throw new Parse.Error(
+        Parse.Error.INVALID_JSON,
+        '$text search is not supported in the Oracle adapter. Consider using $regex for pattern matching, or implement Oracle Text for full-text search capabilities.'
+      );
     }
 
     if (fieldValue.__type === 'Pointer') {
@@ -605,6 +741,28 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         direction: 'ASC',
         distanceExpr: haversineExpr,
       });
+      index += 1;
+    }
+
+    // Legacy $within.$box support (same as $geoWithin.$box)
+    if (fieldValue.$within && fieldValue.$within.$box && isGeoPointField) {
+      const col = quoteIdentifier(fieldName);
+      const box = fieldValue.$within.$box;
+      const left = box[0].longitude;
+      const bottom = box[0].latitude;
+      const right = box[1].longitude;
+      const top = box[1].latitude;
+
+      patterns.push(`(
+        TO_NUMBER(JSON_VALUE(${col}, '$.latitude')) >= :boxBottom${index} AND
+        TO_NUMBER(JSON_VALUE(${col}, '$.latitude')) <= :boxTop${index} AND
+        TO_NUMBER(JSON_VALUE(${col}, '$.longitude')) >= :boxLeft${index} AND
+        TO_NUMBER(JSON_VALUE(${col}, '$.longitude')) <= :boxRight${index}
+      )`);
+      values[`boxBottom${index}`] = bottom;
+      values[`boxTop${index}`] = top;
+      values[`boxLeft${index}`] = left;
+      values[`boxRight${index}`] = right;
       index += 1;
     }
 
@@ -683,6 +841,51 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         values[`polyMaxLon${index}`] = maxLon;
         index += 1;
       }
+    }
+
+    // $geoIntersects.$point - check if a polygon contains a point
+    // For Polygon type fields
+    const isPolygonField =
+      schema.fields && schema.fields[fieldName] && schema.fields[fieldName].type === 'Polygon';
+
+    if (fieldValue.$geoIntersects && fieldValue.$geoIntersects.$point && isPolygonField) {
+      const point = fieldValue.$geoIntersects.$point;
+      if (typeof point !== 'object' || point.__type !== 'GeoPoint') {
+        throw new Parse.Error(
+          Parse.Error.INVALID_JSON,
+          'bad $geoIntersects value; $point should be GeoPoint'
+        );
+      }
+      Parse.GeoPoint._validate(point.latitude, point.longitude);
+
+      const col = quoteIdentifier(fieldName);
+      // For Polygon stored as JSON, we use bounding box approximation
+      // Full point-in-polygon would require Oracle Spatial (SDO_GEOMETRY)
+      // The polygon JSON structure has coordinates array
+
+      // Check if point is within the polygon's bounding box
+      // Extract min/max from the polygon coordinates stored in JSON
+      patterns.push(`(
+        :ptLat${index} >= (
+          SELECT MIN(TO_NUMBER(JSON_VALUE(coords.val, '$[1]')))
+          FROM JSON_TABLE(JSON_QUERY(${col}, '$.coordinates'), '$[*]' COLUMNS (val CLOB PATH '$')) coords
+        ) AND
+        :ptLat${index} <= (
+          SELECT MAX(TO_NUMBER(JSON_VALUE(coords.val, '$[1]')))
+          FROM JSON_TABLE(JSON_QUERY(${col}, '$.coordinates'), '$[*]' COLUMNS (val CLOB PATH '$')) coords
+        ) AND
+        :ptLon${index} >= (
+          SELECT MIN(TO_NUMBER(JSON_VALUE(coords.val, '$[0]')))
+          FROM JSON_TABLE(JSON_QUERY(${col}, '$.coordinates'), '$[*]' COLUMNS (val CLOB PATH '$')) coords
+        ) AND
+        :ptLon${index} <= (
+          SELECT MAX(TO_NUMBER(JSON_VALUE(coords.val, '$[0]')))
+          FROM JSON_TABLE(JSON_QUERY(${col}, '$.coordinates'), '$[*]' COLUMNS (val CLOB PATH '$')) coords
+        )
+      )`);
+      values[`ptLat${index}`] = point.latitude;
+      values[`ptLon${index}`] = point.longitude;
+      index += 1;
     }
 
     // Comparison operators ($gt, $lt, $gte, $lte)
@@ -786,16 +989,17 @@ export class OracleStorageAdapter implements StorageAdapter {
     return 'EXPLAIN PLAN FOR ' + query;
   }
 
-  async handleShutdown() {
-    if (this._pool) {
-      try {
-        await this._pool.close(0); // Force close with 0 drain time
-      } catch (error) {
-        console.error('Error closing Oracle pool:', error);
-      }
-      this._pool = null;
-      this._initialized = false;
+  handleShutdown() {
+    if (!this._pool) {
+      return;
     }
+    // Close the pool - Oracle's close is async, but we call it synchronously
+    // to match PostgreSQL's interface. The pool will drain in the background.
+    this._pool.close(0).catch(error => {
+      console.error('Error closing Oracle pool:', error);
+    });
+    this._pool = null;
+    this._initialized = false;
   }
 
   _notifySchemaChange() {
@@ -1461,30 +1665,43 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     const sql = `INSERT INTO ${quoteIdentifier(className)} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
 
-    try {
-      await conn.execute(sql, values);
-      if (!transactionalSession) {
-        await conn.commit();
+    const promise = (async () => {
+      try {
+        await conn.execute(sql, values);
+        if (!transactionalSession) {
+          await conn.commit();
+        }
+        return { ops: [object] };
+      } catch (error) {
+        if (!transactionalSession) {
+          await conn.rollback();
+        }
+        if (error.errorNum === OracleUniqueConstraintViolation) {
+          const err = new Parse.Error(
+            Parse.Error.DUPLICATE_VALUE,
+            'A duplicate value for a field with unique values was provided'
+          );
+          err.underlyingError = error;
+          if (error.message) {
+            const matches = error.message.match(/unique.*\(([^)]+)\)/i);
+            if (matches && Array.isArray(matches)) {
+              err.userInfo = { duplicated_field: matches[1] };
+            }
+          }
+          throw err;
+        }
+        throw error;
+      } finally {
+        if (shouldRelease) {
+          await conn.close();
+        }
       }
-      return { ops: [object] };
-    } catch (error) {
-      if (!transactionalSession) {
-        await conn.rollback();
-      }
-      if (error.errorNum === OracleUniqueConstraintViolation) {
-        const err = new Parse.Error(
-          Parse.Error.DUPLICATE_VALUE,
-          'A duplicate value for a field with unique values was provided'
-        );
-        err.underlyingError = error;
-        throw err;
-      }
-      throw error;
-    } finally {
-      if (shouldRelease) {
-        await conn.close();
-      }
+    })();
+
+    if (transactionalSession) {
+      transactionalSession.batch.push(promise);
     }
+    return promise;
   }
 
   async deleteObjectsByQuery(
@@ -1497,42 +1714,50 @@ export class OracleStorageAdapter implements StorageAdapter {
     const conn = transactionalSession?.conn || (await this._getConnection());
     const shouldRelease = !transactionalSession;
 
-    try {
-      const where = buildWhereClause({
-        schema,
-        query,
-        index: 1,
-        caseInsensitive: false,
-      });
+    const where = buildWhereClause({
+      schema,
+      query,
+      index: 1,
+      caseInsensitive: false,
+    });
 
-      const wherePattern = where.pattern.length > 0 ? `WHERE ${where.pattern}` : 'WHERE 1=1';
+    const wherePattern = where.pattern.length > 0 ? `WHERE ${where.pattern}` : 'WHERE 1=1';
 
-      // Oracle doesn't have DELETE ... RETURNING count directly, use a workaround
-      const sql = `DELETE FROM ${quoteIdentifier(className)} ${wherePattern}`;
-      const result = await conn.execute(sql, where.values);
+    // Oracle doesn't have DELETE ... RETURNING count directly, use a workaround
+    const sql = `DELETE FROM ${quoteIdentifier(className)} ${wherePattern}`;
 
-      if (!transactionalSession) {
-        await conn.commit();
-      }
+    const promise = (async () => {
+      try {
+        const result = await conn.execute(sql, where.values);
 
-      if (result.rowsAffected === 0) {
-        throw new Parse.Error(Parse.Error.OBJECT_NOT_FOUND, 'Object not found.');
-      }
+        if (!transactionalSession) {
+          await conn.commit();
+        }
 
-      return result.rowsAffected;
-    } catch (error) {
-      if (!transactionalSession) {
-        await conn.rollback();
+        if (result.rowsAffected === 0) {
+          throw new Parse.Error(Parse.Error.OBJECT_NOT_FOUND, 'Object not found.');
+        }
+
+        return result.rowsAffected;
+      } catch (error) {
+        if (!transactionalSession) {
+          await conn.rollback();
+        }
+        if (error.errorNum === OracleTableDoesNotExistError) {
+          return; // Don't delete anything if table doesn't exist
+        }
+        throw error;
+      } finally {
+        if (shouldRelease) {
+          await conn.close();
+        }
       }
-      if (error.errorNum === OracleTableDoesNotExistError) {
-        return; // Don't delete anything if table doesn't exist
-      }
-      throw error;
-    } finally {
-      if (shouldRelease) {
-        await conn.close();
-      }
+    })();
+
+    if (transactionalSession) {
+      transactionalSession.batch.push(promise);
     }
+    return promise;
   }
 
   async findOneAndUpdate(
@@ -1592,6 +1817,30 @@ export class OracleStorageAdapter implements StorageAdapter {
           values[paramName] = fieldValue.amount;
         } else if (fieldValue.__op === 'Delete') {
           updateClauses.push(`${quoteIdentifier(fieldName)} = NULL`);
+        } else if (fieldName === 'authData') {
+          // This recursively sets keys on the JSON object, only 1 level deep
+          // Using parse_json_object_set_key function similar to PostgreSQL
+          const col = quoteIdentifier(fieldName);
+          let updateExpr = `COALESCE(${col}, '{}')`;
+
+          Object.keys(fieldValue).forEach(key => {
+            let value = fieldValue[key];
+            if (value) {
+              if (value.__op === 'Delete') {
+                value = null;
+              } else {
+                value = JSON.stringify(value);
+              }
+            }
+            const keyParam = `authKey${paramIndex}`;
+            const valueParam = `authVal${paramIndex}`;
+            values[keyParam] = key;
+            values[valueParam] = value;
+            updateExpr = `parse_json_object_set_key(${updateExpr}, :${keyParam}, :${valueParam})`;
+            paramIndex++;
+          });
+
+          updateClauses.push(`${col} = ${updateExpr}`);
         } else if (fieldValue.__op === 'Add') {
           // Append objects to existing array using stored function
           const paramName = `u${paramIndex++}`;
@@ -2080,6 +2329,41 @@ export class OracleStorageAdapter implements StorageAdapter {
               const sourceField = value.startsWith('$') ? value.substring(1) : value;
               columns.push(`${quoteIdentifier(sourceField)} AS "objectId"`);
               groupColumns.push(quoteIdentifier(sourceField));
+            } else if (field === '_id' && typeof value === 'object' && Object.keys(value).length !== 0) {
+              // Handle complex _id with multiple fields (potentially with date operations)
+              for (const alias in value) {
+                if (typeof value[alias] === 'string' && value[alias]) {
+                  const source = value[alias].startsWith('$') ? value[alias].substring(1) : value[alias];
+                  const quotedSource = quoteIdentifier(source);
+                  if (!groupColumns.includes(quotedSource)) {
+                    groupColumns.push(quotedSource);
+                  }
+                  columns.push(`${quotedSource} AS ${quoteIdentifier(alias)}`);
+                } else if (typeof value[alias] === 'object') {
+                  // Handle date extraction operations
+                  const operation = Object.keys(value[alias])[0];
+                  const source = value[alias][operation];
+                  const sourceField = source.startsWith('$') ? source.substring(1) : source;
+                  const quotedSource = quoteIdentifier(sourceField);
+
+                  if (mongoAggregateToOracle[operation]) {
+                    const dateOp = mongoAggregateToOracle[operation];
+                    let extractExpr;
+
+                    if (dateOp.type === 'EXTRACT') {
+                      extractExpr = `EXTRACT(${dateOp.value} FROM ${quotedSource} AT TIME ZONE 'UTC')`;
+                    } else {
+                      // TO_CHAR for non-EXTRACT operations
+                      extractExpr = `TO_NUMBER(TO_CHAR(${quotedSource} AT TIME ZONE 'UTC', '${dateOp.value}'))`;
+                    }
+
+                    if (!groupColumns.includes(quotedSource)) {
+                      groupColumns.push(quotedSource);
+                    }
+                    columns.push(`${extractExpr} AS ${quoteIdentifier(alias)}`);
+                  }
+                }
+              }
             } else if (typeof value === 'object') {
               if (value.$sum !== undefined) {
                 if (typeof value.$sum === 'string') {
@@ -2237,22 +2521,156 @@ export class OracleStorageAdapter implements StorageAdapter {
     return Promise.resolve();
   }
 
-  async createTransactionalSession(): Promise<any> {
+  // Used for testing purposes
+  async updateEstimatedCount(className: string) {
+    // Oracle uses DBMS_STATS.GATHER_TABLE_STATS for this purpose
+    // For now, we execute ANALYZE equivalent
     const conn = await this._getConnection();
-    return {
-      conn,
-      batch: [],
-    };
+    try {
+      await conn.execute(
+        `BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, :className); END;`,
+        { className }
+      );
+      await conn.commit();
+    } catch (error) {
+      // Ignore errors - stats gathering may not be available in all environments
+      debug('updateEstimatedCount warning:', error.message);
+    } finally {
+      await conn.close();
+    }
+  }
+
+  async createIndexesIfNeeded(
+    className: string,
+    fieldName: string,
+    type: any,
+    conn: ?any
+  ): Promise<void> {
+    const shouldRelease = !conn;
+    conn = conn || (await this._getConnection());
+
+    try {
+      const indexName = `${fieldName}`.substring(0, 128);
+      await conn.execute(
+        `CREATE INDEX ${quoteIdentifier(indexName)} ON ${quoteIdentifier(className)} (${quoteIdentifier(type)})`
+      );
+      await conn.commit();
+    } catch (error) {
+      if (error.errorNum !== OracleDuplicateTableError) {
+        throw error;
+      }
+      // Index already exists, ignore
+    } finally {
+      if (shouldRelease) {
+        await conn.close();
+      }
+    }
+  }
+
+  async dropIndexes(className: string, indexes: any, conn: ?any): Promise<void> {
+    const shouldRelease = !conn;
+    conn = conn || (await this._getConnection());
+
+    try {
+      for (const indexName of indexes) {
+        try {
+          await conn.execute(`DROP INDEX ${quoteIdentifier(indexName)}`);
+        } catch (error) {
+          // Ignore errors if index doesn't exist
+          if (error.errorNum !== OracleTableDoesNotExistError) {
+            debug('dropIndexes warning:', error.message);
+          }
+        }
+      }
+      await conn.commit();
+    } finally {
+      if (shouldRelease) {
+        await conn.close();
+      }
+    }
+  }
+
+  async deleteIdempotencyFunction(options?: Object = {}): Promise<any> {
+    const conn = options.conn || (await this._getConnection());
+    const shouldRelease = !options.conn;
+
+    try {
+      await conn.execute('DROP FUNCTION IF EXISTS parse_idempotency_delete_expired');
+      await conn.commit();
+    } catch (error) {
+      // Ignore errors - function may not exist
+      debug('deleteIdempotencyFunction warning:', error.message);
+    } finally {
+      if (shouldRelease) {
+        await conn.close();
+      }
+    }
+  }
+
+  async ensureIdempotencyFunctionExists(options?: Object = {}): Promise<any> {
+    const conn = options.conn || (await this._getConnection());
+    const shouldRelease = !options.conn;
+    const ttlSeconds = options.ttl !== undefined ? options.ttl : 60;
+
+    try {
+      // Create a stored procedure for deleting expired idempotency records
+      // Oracle doesn't support dynamic interval in the same way as PostgreSQL
+      await conn.execute(`
+        CREATE OR REPLACE PROCEDURE parse_idempotency_delete_expired AS
+        BEGIN
+          DELETE FROM "_Idempotency" WHERE "expire" < (SYSTIMESTAMP - INTERVAL '${ttlSeconds}' SECOND);
+          COMMIT;
+        END;
+      `);
+      await conn.commit();
+    } catch (error) {
+      debug('ensureIdempotencyFunctionExists warning:', error.message);
+    } finally {
+      if (shouldRelease) {
+        await conn.close();
+      }
+    }
+  }
+
+  async createTransactionalSession(): Promise<any> {
+    return new Promise(async (resolve) => {
+      const conn = await this._getConnection();
+      const transactionalSession = {};
+      transactionalSession.conn = conn;
+      transactionalSession.t = conn; // Alias for compatibility with PostgreSQL pattern
+      transactionalSession.batch = [];
+      transactionalSession.promise = new Promise((resolveInner) => {
+        transactionalSession.resolve = resolveInner;
+      });
+      transactionalSession.result = transactionalSession.promise.then(async () => {
+        // Wait for all batch operations to complete
+        await Promise.all(transactionalSession.batch);
+        await conn.commit();
+        await conn.close();
+      }).catch(async (error) => {
+        await conn.rollback();
+        await conn.close();
+        throw error;
+      });
+      resolve(transactionalSession);
+    });
   }
 
   async commitTransactionalSession(transactionalSession: any): Promise<void> {
-    await transactionalSession.conn.commit();
-    await transactionalSession.conn.close();
+    // Resolve the inner promise to trigger commit
+    transactionalSession.resolve();
+    return transactionalSession.result;
   }
 
   async abortTransactionalSession(transactionalSession: any): Promise<void> {
-    await transactionalSession.conn.rollback();
-    await transactionalSession.conn.close();
+    // Add a rejection to trigger rollback
+    transactionalSession.batch.push(Promise.reject(new Error('Transaction aborted')));
+    transactionalSession.resolve();
+    try {
+      await transactionalSession.result;
+    } catch (error) {
+      // Expected - transaction was aborted
+    }
   }
 
   async ensureIndex(
