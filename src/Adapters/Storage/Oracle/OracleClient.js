@@ -27,6 +27,9 @@ export async function createClient(uri, databaseOptions) {
   }
 
   // Set default pool configuration if not specified
+  // Use a unique pool alias to avoid conflicts when multiple adapters are created
+  const defaultPoolAlias = `parseServer_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
   const poolConfig = {
     user: dbOptions.user,
     password: dbOptions.password,
@@ -37,7 +40,7 @@ export async function createClient(uri, databaseOptions) {
     poolTimeout: dbOptions.poolTimeout || 60,
     poolPingInterval: dbOptions.poolPingInterval || 60,
     stmtCacheSize: dbOptions.stmtCacheSize || 30,
-    poolAlias: dbOptions.poolAlias || 'parseServer',
+    poolAlias: dbOptions.poolAlias || defaultPoolAlias,
   };
 
   // Handle external authentication (wallet without user/password)
