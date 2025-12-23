@@ -1084,6 +1084,11 @@ export class OracleStorageAdapter implements StorageAdapter {
     this._onchange();
   }
 
+  // Helper to apply collection prefix to className (like MongoDB's _adaptiveCollection)
+  _prefixTableName(className: string): string {
+    return this._collectionPrefix + className;
+  }
+
   async _ensureSchemaCollectionExists(conn: any) {
     conn = conn || (await this._getConnection());
     const shouldRelease = !arguments[0];
@@ -1117,9 +1122,10 @@ export class OracleStorageAdapter implements StorageAdapter {
   async classExists(name: string) {
     const conn = await this._getConnection();
     try {
+      const prefixedName = this._prefixTableName(name);
       const result = await conn.execute(
-        `SELECT COUNT(*) AS cnt FROM user_tables WHERE table_name = :name`,
-        { name }
+        `SELECT COUNT(*) AS cnt FROM user_tables WHERE table_name = :prefixedName`,
+        { prefixedName }
       );
       return result.rows[0].CNT > 0;
     } finally {
@@ -1137,7 +1143,13 @@ export class OracleStorageAdapter implements StorageAdapter {
       );
 
       if (result.rows.length > 0) {
-        let schema = JSON.parse(result.rows[0].schema);
+        // Handle CLOB
+        let schemaData = result.rows[0].schema;
+        if (schemaData && typeof schemaData === 'object' && schemaData.constructor.name === 'Lob') {
+          schemaData = await schemaData.getData();
+        }
+        
+        let schema = JSON.parse(schemaData);
         schema.classLevelPermissions = CLPs;
 
         await conn.execute(
@@ -1209,7 +1221,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         const indexName = `${className}_${idx.name}`.substring(0, 128);
         try {
           await conn.execute(
-            `CREATE INDEX ${quoteIdentifier(indexName)} ON ${quoteIdentifier(className)} (${columns})`
+            `CREATE INDEX ${quoteIdentifier(indexName)} ON ${quoteIdentifier(this._prefixTableName(className))} (${columns})`
           );
         } catch (error) {
           if (error.errorNum !== OracleDuplicateTableError) {
@@ -1252,20 +1264,25 @@ export class OracleStorageAdapter implements StorageAdapter {
     conn = conn || (await this._getConnection());
 
     try {
+      debug('createClass', className, 'schema:', JSON.stringify(schema));
       await this.createTable(className, schema, conn);
 
       // Insert into _SCHEMA
+      debug('Inserting into _SCHEMA for class:', className);
       await conn.execute(
         `INSERT INTO "_SCHEMA" ("className", "schema", "isParseClass") VALUES (:className, :schema, 1)`,
         { className, schema: JSON.stringify(schema) }
       );
+      debug('Schema inserted successfully');
 
-      await this.setIndexesWithSchemaFormat(className, schema.indexes, {}, schema.fields, conn);
+      await this.setIndexesWithSchemaFormat(className, schema.indexes || {}, {}, schema.fields, conn);
       await conn.commit();
+      debug('createClass committed successfully');
 
       this._notifySchemaChange();
       return toParseSchema(schema);
     } catch (err) {
+      debug('createClass error:', err);
       await conn.rollback();
       if (err.errorNum === OracleUniqueConstraintViolation) {
         throw new Parse.Error(Parse.Error.DUPLICATE_VALUE, `Class ${className} already exists.`);
@@ -1319,7 +1336,8 @@ export class OracleStorageAdapter implements StorageAdapter {
         }
       });
 
-      const createTableSQL = `CREATE TABLE ${quoteIdentifier(className)} (${columns.join(', ')})`;
+      const prefixedClassName = this._prefixTableName(className);
+      const createTableSQL = `CREATE TABLE ${quoteIdentifier(prefixedClassName)} (${columns.join(', ')})`;
 
       try {
         await conn.execute(createTableSQL);
@@ -1362,10 +1380,11 @@ export class OracleStorageAdapter implements StorageAdapter {
     conn = conn || (await this._getConnection());
 
     try {
+      const prefixedClassName = this._prefixTableName(className);
       // Get existing columns
       const result = await conn.execute(
-        `SELECT column_name FROM user_tab_columns WHERE table_name = :className`,
-        { className }
+        `SELECT column_name FROM user_tab_columns WHERE table_name = :prefixedClassName`,
+        { prefixedClassName }
       );
       const existingColumns = result.rows.map(row => row.COLUMN_NAME);
 
@@ -1383,23 +1402,27 @@ export class OracleStorageAdapter implements StorageAdapter {
   }
 
   async addFieldIfNotExists(className: string, fieldName: string, type: any, conn: ?any) {
-    debug('addFieldIfNotExists');
+    debug('addFieldIfNotExists', className, fieldName, type);
     const shouldRelease = !conn;
     conn = conn || (await this._getConnection());
 
     try {
+      const prefixedClassName = this._prefixTableName(className);
+      
       if (type.type !== 'Relation') {
         const oracleType =
           fieldName === 'objectId' ? 'VARCHAR2(120)' : parseTypeToOracleType(type);
         try {
           await conn.execute(
-            `ALTER TABLE ${quoteIdentifier(className)} ADD ${quoteIdentifier(fieldName)} ${oracleType}`
+            `ALTER TABLE ${quoteIdentifier(prefixedClassName)} ADD ${quoteIdentifier(fieldName)} ${oracleType}`
           );
         } catch (error) {
           if (error.errorNum === OracleTableDoesNotExistError) {
+            debug('Table does not exist, creating class:', className);
             return this.createClass(className, { fields: { [fieldName]: type } }, conn);
           }
           if (error.errorNum !== OracleDuplicateColumnError) {
+            debug('Error adding field:', error);
             throw error;
           }
           // Column already exists, created by other request
@@ -1429,7 +1452,13 @@ export class OracleStorageAdapter implements StorageAdapter {
       );
 
       if (schemaResult.rows.length > 0) {
-        const existingSchema = JSON.parse(schemaResult.rows[0].schema);
+        // Handle CLOB
+        let schemaData = schemaResult.rows[0].schema;
+        if (schemaData && typeof schemaData === 'object' && schemaData.constructor.name === 'Lob') {
+          schemaData = await schemaData.getData();
+        }
+        
+        const existingSchema = JSON.parse(schemaData);
         if (existingSchema.fields[fieldName]) {
           throw 'Attempted to add a field that already exists';
         }
@@ -1459,7 +1488,13 @@ export class OracleStorageAdapter implements StorageAdapter {
       );
 
       if (result.rows.length > 0) {
-        const schema = JSON.parse(result.rows[0].schema);
+        // Handle CLOB
+        let schemaData = result.rows[0].schema;
+        if (schemaData && typeof schemaData === 'object' && schemaData.constructor.name === 'Lob') {
+          schemaData = await schemaData.getData();
+        }
+        
+        const schema = JSON.parse(schemaData);
         schema.fields[fieldName] = type;
 
         await conn.execute(
@@ -1477,7 +1512,8 @@ export class OracleStorageAdapter implements StorageAdapter {
   async deleteClass(className: string) {
     const conn = await this._getConnection();
     try {
-      await conn.execute(`DROP TABLE ${quoteIdentifier(className)}`);
+      const prefixedClassName = this._prefixTableName(className);
+      await conn.execute(`DROP TABLE ${quoteIdentifier(prefixedClassName)}`);
       await conn.execute(
         `DELETE FROM "_SCHEMA" WHERE "className" = :className`,
         { className }
@@ -1516,12 +1552,18 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
 
       // Collect all tables to drop
-      const joins = results.reduce((list, schema) => {
-        const schemaObj = typeof schema.schema === 'string'
-          ? JSON.parse(schema.schema)
-          : schema.schema;
+      const joins = await results.reduce(async (listPromise, schema) => {
+        const list = await listPromise;
+        // Handle CLOB
+        let schemaData = schema.schema;
+        if (schemaData && typeof schemaData === 'object' && schemaData.constructor.name === 'Lob') {
+          schemaData = await schemaData.getData();
+        }
+        const schemaObj = typeof schemaData === 'string'
+          ? JSON.parse(schemaData)
+          : schemaData;
         return list.concat(joinTablesForSchema(schemaObj));
-      }, []);
+      }, Promise.resolve([]));
 
       const classes = [
         '_SCHEMA',
@@ -1576,10 +1618,11 @@ export class OracleStorageAdapter implements StorageAdapter {
       );
 
       // Drop columns
+      const prefixedClassName = this._prefixTableName(className);
       for (const columnName of columnsToDelete) {
         try {
           await conn.execute(
-            `ALTER TABLE ${quoteIdentifier(className)} DROP COLUMN ${quoteIdentifier(columnName)}`
+            `ALTER TABLE ${quoteIdentifier(prefixedClassName)} DROP COLUMN ${quoteIdentifier(columnName)}`
           );
         } catch (error) {
           // Ignore if column doesn't exist
@@ -1597,10 +1640,16 @@ export class OracleStorageAdapter implements StorageAdapter {
     const conn = await this._getConnection();
     try {
       const result = await conn.execute('SELECT * FROM "_SCHEMA"');
-      return result.rows.map(row => {
-        const schema = typeof row.schema === 'string' ? JSON.parse(row.schema) : row.schema;
+      const classes = await Promise.all(result.rows.map(async row => {
+        // Handle CLOB - oracledb returns CLOBs as Lob objects
+        let schemaData = row.schema;
+        if (schemaData && typeof schemaData === 'object' && schemaData.constructor.name === 'Lob') {
+          schemaData = await schemaData.getData();
+        }
+        const schema = typeof schemaData === 'string' ? JSON.parse(schemaData) : schemaData;
         return toParseSchema({ className: row.className, ...schema });
-      });
+      }));
+      return classes;
     } catch (error) {
       if (error.errorNum === OracleTableDoesNotExistError) {
         return [];
@@ -1624,9 +1673,17 @@ export class OracleStorageAdapter implements StorageAdapter {
         throw undefined;
       }
 
-      const schema = typeof result.rows[0].schema === 'string'
-        ? JSON.parse(result.rows[0].schema)
-        : result.rows[0].schema;
+      // Handle CLOB - oracledb returns CLOBs as Lob objects by default
+      // We configured fetchAsString for CLOBs in OracleClient, but let's be safe
+      let schemaData = result.rows[0].schema;
+      if (schemaData && typeof schemaData === 'object' && schemaData.constructor.name === 'Lob') {
+        // Read CLOB as string
+        schemaData = await schemaData.getData();
+      }
+      
+      const schema = typeof schemaData === 'string'
+        ? JSON.parse(schemaData)
+        : schemaData;
       return toParseSchema(schema);
     } finally {
       await conn.close();
@@ -1745,7 +1802,8 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
     });
 
-    const sql = `INSERT INTO ${quoteIdentifier(className)} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
+    const prefixedClassName = this._prefixTableName(className);
+    const sql = `INSERT INTO ${quoteIdentifier(prefixedClassName)} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
 
     const promise = (async () => {
       try {
@@ -1806,7 +1864,8 @@ export class OracleStorageAdapter implements StorageAdapter {
     const wherePattern = where.pattern.length > 0 ? `WHERE ${where.pattern}` : 'WHERE 1=1';
 
     // Oracle doesn't have DELETE ... RETURNING count directly, use a workaround
-    const sql = `DELETE FROM ${quoteIdentifier(className)} ${wherePattern}`;
+    const prefixedClassName = this._prefixTableName(className);
+    const sql = `DELETE FROM ${quoteIdentifier(prefixedClassName)} ${wherePattern}`;
 
     const promise = (async () => {
       try {
@@ -1999,13 +2058,14 @@ export class OracleStorageAdapter implements StorageAdapter {
       Object.assign(values, where.values);
 
       const whereClause = where.pattern.length > 0 ? `WHERE ${where.pattern}` : '';
+      const prefixedClassName = this._prefixTableName(className);
 
       // Update and then select the updated rows
-      const updateSql = `UPDATE ${quoteIdentifier(className)} SET ${updateClauses.join(', ')} ${whereClause}`;
+      const updateSql = `UPDATE ${quoteIdentifier(prefixedClassName)} SET ${updateClauses.join(', ')} ${whereClause}`;
       await conn.execute(updateSql, values);
 
       // Fetch the updated rows
-      const selectSql = `SELECT * FROM ${quoteIdentifier(className)} ${whereClause}`;
+      const selectSql = `SELECT * FROM ${quoteIdentifier(prefixedClassName)} ${whereClause}`;
       const result = await conn.execute(selectSql, where.values);
 
       if (!transactionalSession) {
@@ -2115,7 +2175,8 @@ export class OracleStorageAdapter implements StorageAdapter {
         paginationPattern = `${offsetPart} ${limitPart}`.trim();
       }
 
-      const sql = `SELECT ${columns} FROM ${quoteIdentifier(className)} ${wherePattern} ${sortPattern} ${paginationPattern}`;
+      const prefixedClassName = this._prefixTableName(className);
+      const sql = `SELECT ${columns} FROM ${quoteIdentifier(prefixedClassName)} ${wherePattern} ${sortPattern} ${paginationPattern}`;
 
       if (explain) {
         await conn.execute(this.createExplainableQuery(sql), where.values);
@@ -2264,7 +2325,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       const columns = fieldNames.map(f => quoteIdentifier(f)).join(', ');
 
       await conn.execute(
-        `CREATE UNIQUE INDEX ${quoteIdentifier(constraintName)} ON ${quoteIdentifier(className)} (${columns})`
+        `CREATE UNIQUE INDEX ${quoteIdentifier(constraintName)} ON ${quoteIdentifier(this._prefixTableName(className))} (${columns})`
       );
       await conn.commit();
     } catch (error) {
@@ -2309,7 +2370,8 @@ export class OracleStorageAdapter implements StorageAdapter {
       // For estimate, Oracle doesn't have a direct equivalent to pg_class.reltuples
       // We could use NUM_ROWS from user_tables but it requires ANALYZE
       // For Milestone 1, always use exact count
-      const sql = `SELECT COUNT(*) AS cnt FROM ${quoteIdentifier(className)} ${wherePattern}`;
+      const prefixedClassName = this._prefixTableName(className);
+      const sql = `SELECT COUNT(*) AS cnt FROM ${quoteIdentifier(prefixedClassName)} ${wherePattern}`;
 
       const result = await conn.execute(sql, where.values);
       return result.rows[0].CNT;
@@ -2342,7 +2404,8 @@ export class OracleStorageAdapter implements StorageAdapter {
 
       const wherePattern = where.pattern.length > 0 ? `WHERE ${where.pattern}` : '';
 
-      const sql = `SELECT DISTINCT ${quoteIdentifier(fieldName)} FROM ${quoteIdentifier(className)} ${wherePattern}`;
+      const prefixedClassName = this._prefixTableName(className);
+      const sql = `SELECT DISTINCT ${quoteIdentifier(fieldName)} FROM ${quoteIdentifier(prefixedClassName)} ${wherePattern}`;
 
       const result = await conn.execute(sql, where.values);
 
@@ -2512,7 +2575,8 @@ export class OracleStorageAdapter implements StorageAdapter {
         }
       }
 
-      const sql = `SELECT ${columns.join(', ')} FROM ${quoteIdentifier(className)} ${wherePattern} ${groupPattern} ${sortPattern} ${skipPattern} ${limitPattern}`;
+      const prefixedClassName = this._prefixTableName(className);
+      const sql = `SELECT ${columns.join(', ')} FROM ${quoteIdentifier(prefixedClassName)} ${wherePattern} ${groupPattern} ${sortPattern} ${skipPattern} ${limitPattern}`;
 
       const result = await conn.execute(sql, values);
 
@@ -2595,7 +2659,7 @@ export class OracleStorageAdapter implements StorageAdapter {
 
         try {
           await conn.execute(
-            `CREATE INDEX ${quoteIdentifier(indexName)} ON ${quoteIdentifier(className)} (${columns})`
+            `CREATE INDEX ${quoteIdentifier(indexName)} ON ${quoteIdentifier(this._prefixTableName(className))} (${columns})`
           );
         } catch (error) {
           if (error.errorNum !== OracleDuplicateTableError) {
@@ -2614,9 +2678,10 @@ export class OracleStorageAdapter implements StorageAdapter {
   async getIndexes(className: string) {
     const conn = await this._getConnection();
     try {
+      const prefixedClassName = this._prefixTableName(className);
       const result = await conn.execute(
-        `SELECT index_name, column_name FROM user_ind_columns WHERE table_name = :className`,
-        { className }
+        `SELECT index_name, column_name FROM user_ind_columns WHERE table_name = :prefixedClassName`,
+        { prefixedClassName }
       );
       return result.rows;
     } finally {
@@ -2634,9 +2699,10 @@ export class OracleStorageAdapter implements StorageAdapter {
     // For now, we execute ANALYZE equivalent
     const conn = await this._getConnection();
     try {
+      const prefixedClassName = this._prefixTableName(className);
       await conn.execute(
-        `BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, :className); END;`,
-        { className }
+        `BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, :prefixedClassName); END;`,
+        { prefixedClassName }
       );
       await conn.commit();
     } catch (error) {
@@ -2659,7 +2725,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     try {
       const indexName = `${fieldName}`.substring(0, 128);
       await conn.execute(
-        `CREATE INDEX ${quoteIdentifier(indexName)} ON ${quoteIdentifier(className)} (${quoteIdentifier(type)})`
+        `CREATE INDEX ${quoteIdentifier(indexName)} ON ${quoteIdentifier(this._prefixTableName(className))} (${quoteIdentifier(type)})`
       );
       await conn.commit();
     } catch (error) {
@@ -2800,7 +2866,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         : fieldNames.map(f => quoteIdentifier(f)).join(', ');
 
       await conn.execute(
-        `CREATE INDEX ${quoteIdentifier(finalIndexName)} ON ${quoteIdentifier(className)} (${columns})`
+        `CREATE INDEX ${quoteIdentifier(finalIndexName)} ON ${quoteIdentifier(this._prefixTableName(className))} (${columns})`
       );
       await conn.commit();
     } catch (error) {

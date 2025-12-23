@@ -8,9 +8,10 @@ const Config = require('../lib/Config');
 const getColumns = async (adapter, className) => {
   const conn = await adapter._getConnection();
   try {
+    const prefixedClassName = adapter._prefixTableName(className);
     const result = await conn.execute(
-      `SELECT column_name FROM user_tab_columns WHERE table_name = :className`,
-      { className }
+      `SELECT column_name FROM user_tab_columns WHERE table_name = :prefixedClassName`,
+      { prefixedClassName }
     );
     return result.rows.map(row => row.COLUMN_NAME);
   } finally {
@@ -21,7 +22,8 @@ const getColumns = async (adapter, className) => {
 const dropTable = async (adapter, className) => {
   const conn = await adapter._getConnection();
   try {
-    await conn.execute(`DROP TABLE "${className}"`);
+    const prefixedClassName = adapter._prefixTableName(className);
+    await conn.execute(`DROP TABLE "${prefixedClassName}"`);
     await conn.commit();
   } catch (error) {
     // Ignore if table doesn't exist
