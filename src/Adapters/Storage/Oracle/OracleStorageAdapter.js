@@ -1395,6 +1395,36 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     try {
       const prefixedClassName = this._prefixTableName(className);
+      
+      // Volatile classes should not be saved to _SCHEMA (they're in-memory only)
+      const volatileClasses = [
+        '_JobStatus',
+        '_PushStatus',
+        '_Hooks',
+        '_GlobalConfig',
+        '_GraphQLConfig',
+        '_JobSchedule',
+        '_Audience',
+        '_Idempotency',
+      ];
+      
+      // First, ensure non-volatile classes exist in _SCHEMA
+      if (!volatileClasses.includes(className)) {
+        const schemaCheck = await conn.execute(
+          `SELECT COUNT(*) as cnt FROM "_SCHEMA" WHERE "className" = :className`,
+          { className }
+        );
+        
+        if (schemaCheck.rows[0].CNT === 0) {
+          // Class not in _SCHEMA, insert it
+          debug('schemaUpgrade: Class not in _SCHEMA, inserting:', className);
+          await conn.execute(
+            `INSERT INTO "_SCHEMA" ("className", "schema", "isParseClass") VALUES (:className, :schema, 1)`,
+            { className, schema: JSON.stringify(schema) }
+          );
+        }
+      }
+      
       // Get existing columns
       const result = await conn.execute(
         `SELECT column_name FROM user_tab_columns WHERE table_name = :prefixedClassName`,
@@ -1408,10 +1438,20 @@ export class OracleStorageAdapter implements StorageAdapter {
           await this.addFieldIfNotExists(className, fieldName, schema.fields[fieldName], conn);
         }
       }
+      
+      // Commit if we own the connection
+      if (shouldRelease) {
+        await conn.commit();
+      }
     } finally {
       if (shouldRelease) {
         await conn.close();
       }
+    }
+    
+    // Notify after transaction
+    if (shouldRelease) {
+      this._notifySchemaChange();
     }
   }
 
