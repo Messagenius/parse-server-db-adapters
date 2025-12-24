@@ -17,7 +17,9 @@ function loadSql(file) {
   }
 
   const fullPath = path.join(__dirname, file);
-  const content = fs.readFileSync(fullPath, 'utf8');
+  let content = fs.readFileSync(fullPath, 'utf8');
+  // Remove trailing '/' which is used by sqlplus but causes errors with oracledb driver
+  content = content.trim().replace(/\/\s*$/, '').trim();
   sqlCache[file] = content;
   return content;
 }
