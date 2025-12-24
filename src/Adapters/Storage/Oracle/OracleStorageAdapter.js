@@ -28,6 +28,25 @@ const debug = function (...args: any) {
   log.debug.apply(log, args);
 };
 
+// Ensure Oracle errors have a proper string message for Jasmine compatibility
+const ensureErrorMessage = (error: any): Error => {
+  if (error instanceof Parse.Error) {
+    return error;
+  }
+  if (error && typeof error.message === 'string' && error.message.length > 0) {
+    return error;
+  }
+  // Create a new error with a proper message
+  const message = error?.message || 
+    (error?.errorNum ? `Oracle error ORA-${String(error.errorNum).padStart(5, '0')}` : 'Unknown database error');
+  const newError = new Error(message);
+  // Copy Oracle-specific properties
+  if (error?.errorNum) newError.errorNum = error.errorNum;
+  if (error?.offset) newError.offset = error.offset;
+  if (error?.code) newError.code = error.code;
+  return newError;
+};
+
 const ORACLE_VARCHAR_MAX = 4000;
 
 // Map Parse types to Oracle SQL types
@@ -1111,7 +1130,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       }
     } catch (error) {
       if (error.errorNum !== OracleDuplicateTableError) {
-        throw error;
+        throw ensureErrorMessage(error);
       }
     } finally {
       if (shouldRelease) {
@@ -1226,7 +1245,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           );
         } catch (error) {
           if (error.errorNum !== OracleDuplicateTableError) {
-            throw error;
+            throw ensureErrorMessage(error);
           }
         }
       }
@@ -1296,7 +1315,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (err.errorNum === OracleUniqueConstraintViolation) {
         throw new Parse.Error(Parse.Error.DUPLICATE_VALUE, `Class ${className} already exists.`);
       }
-      throw err;
+      throw ensureErrorMessage(err);
     } finally {
       if (shouldRelease) {
         await conn.close();
@@ -1366,7 +1385,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         await conn.execute(createTableSQL);
       } catch (error) {
         if (error.errorNum !== OracleDuplicateTableError) {
-          throw error;
+          throw ensureErrorMessage(error);
         }
         // Table already exists, must have been created by a different request
       }
@@ -1384,7 +1403,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           `);
         } catch (error) {
           if (error.errorNum !== OracleDuplicateTableError) {
-            throw error;
+            throw ensureErrorMessage(error);
           }
         }
       }
@@ -1490,7 +1509,7 @@ export class OracleStorageAdapter implements StorageAdapter {
               await new Promise(resolve => setTimeout(resolve, 100 * (4 - retries)));
               return addColumn(retries - 1);
             }
-            throw error;
+            throw ensureErrorMessage(error);
           }
         };
         
@@ -1531,7 +1550,7 @@ export class OracleStorageAdapter implements StorageAdapter {
             }
           } else if (error.errorNum !== OracleDuplicateColumnError) {
             debug('Error adding field:', error);
-            throw error;
+            throw ensureErrorMessage(error);
           }
           // Column already exists, created by other request - continue to add to schema
         }
@@ -1548,7 +1567,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           `);
         } catch (error) {
           if (error.errorNum !== OracleDuplicateTableError) {
-            throw error;
+            throw ensureErrorMessage(error);
           }
         }
       }
@@ -1579,7 +1598,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (shouldRelease) {
         await conn.rollback();
       }
-      throw error;
+      throw ensureErrorMessage(error);
     } finally {
       if (shouldRelease) {
         await conn.close();
@@ -1636,7 +1655,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       return className.indexOf('_Join:') !== 0;
     } catch (error) {
       await conn.rollback();
-      throw error;
+      throw ensureErrorMessage(error);
     } finally {
       await conn.close();
     }
@@ -1659,7 +1678,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         results = schemaResult.rows;
       } catch (error) {
         if (error.errorNum !== OracleTableDoesNotExistError) {
-          throw error;
+          throw ensureErrorMessage(error);
         }
         return; // No _SCHEMA table, nothing to delete
       }
@@ -1702,7 +1721,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           await conn.execute(`DROP TABLE ${quoteIdentifier(tableName)}`);
         } catch (error) {
           if (error.errorNum !== OracleTableDoesNotExistError) {
-            throw error;
+            throw ensureErrorMessage(error);
           }
         }
       }
@@ -1783,7 +1802,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (error.errorNum === OracleTableDoesNotExistError) {
         return [];
       }
-      throw error;
+      throw ensureErrorMessage(error);
     } finally {
       await conn.close();
     }
@@ -1972,9 +1991,9 @@ export class OracleStorageAdapter implements StorageAdapter {
               err.userInfo = { duplicated_field: matches[1] };
             }
           }
-          throw err;
+          throw ensureErrorMessage(err);
         }
-        throw error;
+        throw ensureErrorMessage(error);
       } finally {
         if (shouldRelease) {
           await conn.close();
@@ -2031,7 +2050,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         if (error.errorNum === OracleTableDoesNotExistError) {
           return; // Don't delete anything if table doesn't exist
         }
-        throw error;
+        throw ensureErrorMessage(error);
       } finally {
         if (shouldRelease) {
           await conn.close();
@@ -2221,7 +2240,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (!transactionalSession) {
         await conn.rollback();
       }
-      throw error;
+      throw ensureErrorMessage(error);
     } finally {
       if (shouldRelease) {
         await conn.close();
@@ -2241,7 +2260,7 @@ export class OracleStorageAdapter implements StorageAdapter {
     return this.createObject(className, schema, createValue, transactionalSession).catch(error => {
       // ignore duplicate value errors as it's upsert
       if (error.code !== Parse.Error.DUPLICATE_VALUE) {
-        throw error;
+        throw ensureErrorMessage(error);
       }
       return this.findOneAndUpdate(className, schema, query, update, transactionalSession);
     });
@@ -2335,7 +2354,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (error.errorNum === OracleTableDoesNotExistError) {
         return [];
       }
-      throw error;
+      throw ensureErrorMessage(error);
     } finally {
       await conn.close();
     }
@@ -2483,7 +2502,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           'A duplicate value for a field with unique values was provided'
         );
       }
-      throw error;
+      throw ensureErrorMessage(error);
     } finally {
       await conn.close();
     }
@@ -2523,7 +2542,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (error.errorNum === OracleTableDoesNotExistError) {
         return 0;
       }
-      throw error;
+      throw ensureErrorMessage(error);
     } finally {
       await conn.close();
     }
@@ -2570,7 +2589,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (error.errorNum === OracleMissingColumnError) {
         return [];
       }
-      throw error;
+      throw ensureErrorMessage(error);
     } finally {
       await conn.close();
     }
@@ -2735,7 +2754,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (error.errorNum === OracleTableDoesNotExistError) {
         return [];
       }
-      throw error;
+      throw ensureErrorMessage(error);
     } finally {
       await conn.close();
     }
@@ -2756,7 +2775,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           ) {
             return Promise.resolve();
           }
-          throw err;
+          throw ensureErrorMessage(err);
         })
         .then(() => this.schemaUpgrade(schema.className, schema));
     });
@@ -2807,7 +2826,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           );
         } catch (error) {
           if (error.errorNum !== OracleDuplicateTableError) {
-            throw error;
+            throw ensureErrorMessage(error);
           }
         }
       }
@@ -2874,7 +2893,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       await conn.commit();
     } catch (error) {
       if (error.errorNum !== OracleDuplicateTableError) {
-        throw error;
+        throw ensureErrorMessage(error);
       }
       // Index already exists, ignore
     } finally {
@@ -2967,7 +2986,7 @@ export class OracleStorageAdapter implements StorageAdapter {
       }).catch(async (error) => {
         await conn.rollback();
         await conn.close();
-        throw error;
+        throw ensureErrorMessage(error);
       });
       resolve(transactionalSession);
     });
@@ -3024,7 +3043,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           'A duplicate value for a field with unique values was provided'
         );
       }
-      throw error;
+      throw ensureErrorMessage(error);
     } finally {
       if (shouldRelease) {
         await conn.close();
