@@ -8,12 +8,18 @@ CREATE OR REPLACE FUNCTION parse_json_object_set_key(
 ) RETURN CLOB
 IS
   v_result CLOB;
+  v_patch CLOB;
 BEGIN
   -- Use JSON_MERGEPATCH to set/update a key in the JSON object
   -- First, create a patch object with the key to set
+  SELECT TO_CLOB(JSON_OBJECT(p_key_to_set VALUE JSON_QUERY(p_value, '$' WITH WRAPPER) RETURNING VARCHAR2(4000)))
+  INTO v_patch
+  FROM DUAL;
+
   SELECT JSON_MERGEPATCH(
-    COALESCE(p_json, '{}'),
-    JSON_OBJECT(p_key_to_set VALUE JSON_QUERY(p_value, '$' WITH WRAPPER) RETURNING CLOB)
+    COALESCE(p_json, TO_CLOB('{}')),
+    v_patch
+    RETURNING CLOB
   ) INTO v_result
   FROM DUAL;
 
@@ -21,9 +27,14 @@ BEGIN
 EXCEPTION
   WHEN OTHERS THEN
     -- If JSON_QUERY fails (for non-JSON values), try as scalar
+    SELECT TO_CLOB(JSON_OBJECT(p_key_to_set VALUE p_value RETURNING VARCHAR2(4000)))
+    INTO v_patch
+    FROM DUAL;
+    
     SELECT JSON_MERGEPATCH(
-      COALESCE(p_json, '{}'),
-      JSON_OBJECT(p_key_to_set VALUE p_value RETURNING CLOB)
+      COALESCE(p_json, TO_CLOB('{}')),
+      v_patch
+      RETURNING CLOB
     ) INTO v_result
     FROM DUAL;
     RETURN v_result;

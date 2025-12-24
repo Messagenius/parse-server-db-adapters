@@ -18,6 +18,7 @@ const OracleDuplicateColumnError = 1430; // ORA-01430: column being added alread
 const OracleMissingColumnError = 904; // ORA-00904: invalid identifier
 const OracleUniqueConstraintViolation = 1; // ORA-00001: unique constraint violated
 const OracleInvalidIdentifier = 904; // ORA-00904
+const OracleDDLConcurrentError = 14411; // ORA-14411: The DDL cannot be run concurrently with other DDLs
 
 const logger = require('../../../logger');
 
@@ -1351,6 +1352,14 @@ export class OracleStorageAdapter implements StorageAdapter {
       });
 
       const prefixedClassName = this._prefixTableName(className);
+      
+      // Oracle doesn't allow creating a table with no columns
+      // Add a dummy objectId column if no columns are specified (will be upgraded later)
+      if (columns.length === 0) {
+        columns.push(`"objectId" VARCHAR2(120)`);
+        columns.push(`PRIMARY KEY ("objectId")`);
+      }
+      
       const createTableSQL = `CREATE TABLE ${quoteIdentifier(prefixedClassName)} (${columns.join(', ')})`;
 
       try {
@@ -1467,10 +1476,26 @@ export class OracleStorageAdapter implements StorageAdapter {
       if (type.type !== 'Relation') {
         const oracleType =
           fieldName === 'objectId' ? 'VARCHAR2(120)' : parseTypeToOracleType(type);
+        
+        // Helper function to add the column with retry for concurrent DDL errors
+        const addColumn = async (retries = 3) => {
+          try {
+            await conn.execute(
+              `ALTER TABLE ${quoteIdentifier(prefixedClassName)} ADD ${quoteIdentifier(fieldName)} ${oracleType}`
+            );
+          } catch (error) {
+            // ORA-14411: DDL cannot be run concurrently - retry with delay
+            if (error.errorNum === OracleDDLConcurrentError && retries > 0) {
+              debug('DDL concurrent error, retrying:', className, fieldName);
+              await new Promise(resolve => setTimeout(resolve, 100 * (4 - retries)));
+              return addColumn(retries - 1);
+            }
+            throw error;
+          }
+        };
+        
         try {
-          await conn.execute(
-            `ALTER TABLE ${quoteIdentifier(prefixedClassName)} ADD ${quoteIdentifier(fieldName)} ${oracleType}`
-          );
+          await addColumn();
         } catch (error) {
           if (error.errorNum === OracleTableDoesNotExistError) {
             debug('Table does not exist, creating class:', className);
@@ -1479,13 +1504,36 @@ export class OracleStorageAdapter implements StorageAdapter {
             if (shouldRelease) {
               await conn.close(); // Close our connection first
             }
-            return this.createClass(className, { fields: { [fieldName]: type } });
-          }
-          if (error.errorNum !== OracleDuplicateColumnError) {
+            try {
+              const result = await this.createClass(className, { fields: { [fieldName]: type } });
+              return result;
+            } catch (createErr) {
+              // If createClass fails due to duplicate (race condition), 
+              // another call created the class. We need to add our field.
+              if (createErr.code === Parse.Error.DUPLICATE_VALUE || 
+                  createErr.errorNum === OracleUniqueConstraintViolation) {
+                debug('createClass got duplicate, will add field separately');
+                // Get a new connection and continue to add the field
+                conn = await this._getConnection();
+                // Try to add the column again (table now exists) with retry
+                try {
+                  await addColumn();
+                } catch (alterErr) {
+                  if (alterErr.errorNum !== OracleDuplicateColumnError) {
+                    throw alterErr;
+                  }
+                  // Column already exists, that's fine
+                }
+                // Continue to add field to schema below
+              } else {
+                throw createErr;
+              }
+            }
+          } else if (error.errorNum !== OracleDuplicateColumnError) {
             debug('Error adding field:', error);
             throw error;
           }
-          // Column already exists, created by other request
+          // Column already exists, created by other request - continue to add to schema
         }
       } else {
         // Create join table for relation
@@ -1505,36 +1553,23 @@ export class OracleStorageAdapter implements StorageAdapter {
         }
       }
 
-      // Check if field already exists in schema
-      const schemaResult = await conn.execute(
-        `SELECT "schema" FROM "_SCHEMA" WHERE "className" = :className`,
-        { className }
-      );
-
-      if (schemaResult.rows.length > 0) {
-        // Handle CLOB
-        let schemaData = schemaResult.rows[0].schema;
-        if (schemaData && typeof schemaData === 'object' && schemaData.constructor.name === 'Lob') {
-          schemaData = await schemaData.getData();
-        }
-        
-        const existingSchema = JSON.parse(schemaData);
-        if (existingSchema.fields && existingSchema.fields[fieldName]) {
-          // Field already exists, nothing to do
-          debug('Field already exists in schema:', fieldName);
-        } else {
-          // Add field to schema
-          if (!existingSchema.fields) {
-            existingSchema.fields = {};
-          }
-          existingSchema.fields[fieldName] = type;
-
-          await conn.execute(
-            `UPDATE "_SCHEMA" SET "schema" = :schema WHERE "className" = :className`,
-            { schema: JSON.stringify(existingSchema), className }
-          );
-        }
+      // Atomically add field to schema using JSON_MERGEPATCH to avoid race conditions
+      // when multiple fields are added concurrently (Promise.all in SchemaController)
+      // The WHERE clause checks if the field doesn't already exist using JSON_EXISTS
+      // Note: JSON path must be a literal in Oracle, so we sanitize and embed the field name
+      const fieldPatch = JSON.stringify({ fields: { [fieldName]: type } });
+      // Sanitize field name for use in JSON path (allow alphanumeric and underscore)
+      const sanitizedFieldName = fieldName.replace(/[^a-zA-Z0-9_]/g, '');
+      if (sanitizedFieldName !== fieldName) {
+        throw new Parse.Error(Parse.Error.INVALID_KEY_NAME, `Invalid field name: ${fieldName}`);
       }
+      const updateResult = await conn.execute(
+        `UPDATE "_SCHEMA" SET "schema" = JSON_MERGEPATCH("schema", :fieldPatch) 
+         WHERE "className" = :className 
+         AND NOT JSON_EXISTS("schema", '$.fields.${sanitizedFieldName}')`,
+        { fieldPatch, className }
+      );
+      debug('addFieldIfNotExists: Updated rows:', updateResult.rowsAffected);
 
       // Only commit if we own the connection (not part of a larger transaction)
       if (shouldRelease) {
@@ -1738,13 +1773,10 @@ export class OracleStorageAdapter implements StorageAdapter {
         const schema = typeof schemaData === 'string' ? JSON.parse(schemaData) : schemaData;
         const parseSchema = toParseSchema({ className: row.className, ...schema });
         debug('getAllClasses: Converted', row.className, 'fields:', Object.keys(parseSchema.fields || {}).length);
-        console.log('🔍 Schema for', row.className, ':', JSON.stringify(parseSchema.fields, null, 2));
         return parseSchema;
       }));
       
       debug('getAllClasses: Returning', classes.length, 'classes:', classes.map(c => c.className).join(', '));
-      console.log('🔍 Oracle getAllClasses returning:', classes.length, 'classes');
-      console.log('🔍 Class names:', classes.map(c => c.className));
       return classes;
     } catch (error) {
       debug('getAllClasses: Error:', error);
@@ -1828,7 +1860,20 @@ export class OracleStorageAdapter implements StorageAdapter {
 
       columns.push(quoteIdentifier(fieldName));
       const paramName = `p${paramIndex++}`;
-      placeholders.push(`:${paramName}`);
+      
+      // Check if this is a Date field to use proper SQL conversion
+      const fieldType = schema.fields[fieldName]?.type;
+      const isDateField = fieldType === 'Date' || 
+        ['_email_verify_token_expires_at', '_account_lockout_expires_at', 
+         '_perishable_token_expires_at', '_password_changed_at',
+         'createdAt', 'updatedAt'].includes(fieldName);
+      
+      if (isDateField) {
+        // Use TO_TIMESTAMP_TZ for proper date conversion from ISO format
+        placeholders.push(`TO_TIMESTAMP_TZ(:${paramName}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3TZH:TZM')`);
+      } else {
+        placeholders.push(`:${paramName}`);
+      }
 
       if (!schema.fields[fieldName] && className === '_User') {
         // Handle special _User fields
@@ -1853,7 +1898,6 @@ export class OracleStorageAdapter implements StorageAdapter {
         return;
       }
 
-      const fieldType = schema.fields[fieldName]?.type;
       switch (fieldType) {
         case 'Date':
           values[paramName] = object[fieldName] ? object[fieldName].iso : null;
@@ -1901,6 +1945,8 @@ export class OracleStorageAdapter implements StorageAdapter {
 
     const prefixedClassName = this._prefixTableName(className);
     const sql = `INSERT INTO ${quoteIdentifier(prefixedClassName)} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
+    debug('createObject SQL:', sql);
+    debug('createObject values:', JSON.stringify(values));
 
     const promise = (async () => {
       try {
@@ -1910,6 +1956,7 @@ export class OracleStorageAdapter implements StorageAdapter {
         }
         return { ops: [object] };
       } catch (error) {
+        debug('createObject error:', error.errorNum, error.message, error.code);
         if (!transactionalSession) {
           await conn.rollback();
         }
@@ -1919,7 +1966,7 @@ export class OracleStorageAdapter implements StorageAdapter {
             'A duplicate value for a field with unique values was provided'
           );
           err.underlyingError = error;
-          if (error.message) {
+          if (error.message && typeof error.message === 'string') {
             const matches = error.message.match(/unique.*\(([^)]+)\)/i);
             if (matches && Array.isArray(matches)) {
               err.userInfo = { duplicated_field: matches[1] };
@@ -2103,7 +2150,7 @@ export class OracleStorageAdapter implements StorageAdapter {
           values[paramName] = fieldValue.objectId;
         } else if (fieldValue.__type === 'Date') {
           const paramName = `u${paramIndex++}`;
-          updateClauses.push(`${quoteIdentifier(fieldName)} = :${paramName}`);
+          updateClauses.push(`${quoteIdentifier(fieldName)} = TO_TIMESTAMP_TZ(:${paramName}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3TZH:TZM')`);
           values[paramName] = toOracleValue(fieldValue);
         } else if (fieldValue.__type === 'File') {
           const paramName = `u${paramIndex++}`;

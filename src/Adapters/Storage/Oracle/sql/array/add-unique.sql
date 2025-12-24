@@ -1,6 +1,6 @@
 -- Function to add unique values to a JSON array
 -- Equivalent to PostgreSQL's array_add_unique function
--- Note: VARCHAR2(32767) is the maximum size for PL/SQL VARCHAR2 in Oracle 12c+
+-- Note: VARCHAR2(4000) is the standard SQL limit in Oracle
 
 CREATE OR REPLACE FUNCTION parse_array_add_unique(
   p_array   IN CLOB,
@@ -8,18 +8,20 @@ CREATE OR REPLACE FUNCTION parse_array_add_unique(
 ) RETURN CLOB
 IS
   v_result CLOB;
+  v_arr CLOB := COALESCE(p_array, '[]');
+  v_vals CLOB := COALESCE(p_values, '[]');
 BEGIN
   -- Combine existing array with new values using UNION (removes duplicates)
   SELECT COALESCE(
-    JSON_ARRAYAGG(val RETURNING CLOB),
+    JSON_ARRAYAGG(val RETURNING VARCHAR2(4000)),
     '[]'
   ) INTO v_result
   FROM (
     SELECT jt.val
-    FROM JSON_TABLE(COALESCE(p_array, '[]'), '$[*]' COLUMNS (val VARCHAR2(32767) PATH '$')) jt
+    FROM JSON_TABLE(v_arr, '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jt
     UNION
     SELECT jn.val
-    FROM JSON_TABLE(COALESCE(p_values, '[]'), '$[*]' COLUMNS (val VARCHAR2(32767) PATH '$')) jn
+    FROM JSON_TABLE(v_vals, '$[*]' COLUMNS (val VARCHAR2(4000) PATH '$')) jn
   );
 
   RETURN v_result;
